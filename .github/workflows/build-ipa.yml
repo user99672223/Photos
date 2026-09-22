@@ -1,0 +1,43 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Write Secrets.xcconfig
+        run: |
+          printf 'HIDRIVE_CLIENT_ID = %s\nHIDRIVE_CLIENT_SECRET = %s\n' "${{ secrets.HIDRIVE_CLIENT_ID }}" "${{ secrets.HIDRIVE_CLIENT_SECRET }}" > Secrets.xcconfig
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build
+        run: |
+          xcodebuild -project PhotoVault.xcodeproj -scheme PhotoVault -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+
+      - name: Package IPA
+        run: |
+          rm -rf Payload && mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/PhotoVault.app Payload/
+          zip -qr PhotoVault-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhotoVault-unsigned.ipa
+          path: PhotoVault-unsigned.ipa
+          retention-days: 30
