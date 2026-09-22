@@ -267,6 +267,16 @@ final class HiDriveClient: NSObject, URLSessionDataDelegate, URLSessionDownloadD
         }
     }
 
+    // Set by the app delegate when iOS relaunches us for background transfer events.
+    static var backgroundCompletionHandler: (() -> Void)?
+
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        DispatchQueue.main.async {
+            HiDriveClient.backgroundCompletionHandler?()
+            HiDriveClient.backgroundCompletionHandler = nil
+        }
+    }
+
     // MARK: - URLSession delegates
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
