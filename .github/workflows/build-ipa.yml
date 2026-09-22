@@ -2,7 +2,7 @@ name: Build unsigned IPA
 
 on:
   push:
-    branches: [main]
+    branches: [main, "claude/funny-dirac-e3hp7o"]
   workflow_dispatch:
 
 jobs:
