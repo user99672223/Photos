@@ -6,13 +6,16 @@ struct SettingsView: View {
     @AppStorage("wifiOnlyBackup") private var wifiOnly = true
     @AppStorage("chargingOnlyBackup") private var chargingOnly = false
     @AppStorage("includeVideos") private var includeVideos = true
+    @AppStorage("autoBackupEnabled") private var autoBackupEnabled = false
     @AppStorage("cellularPolicy") private var cellularPolicy = CellularPolicy.wifiOnly.rawValue
+    @State private var autoBackupAfter = AppSettings.autoBackupAfter
     @State private var cacheCapGB: Double = Double(AppSettings.originalsCacheCapBytes) / 1_000_000_000
     @State private var cacheUsage: Int64 = 0
     @State private var showRecovery = false
     @State private var recoveryString: String?
     @State private var authError: String?
     @State private var connecting = false
+    @State private var signInPage: SignInPage?
     @State private var manualCode = ""
     @State private var showManualCode = false
 
@@ -29,6 +32,9 @@ struct SettingsView: View {
                     Toggle("Wi-Fi only", isOn: $wifiOnly)
                     Toggle("Only while charging", isOn: $chargingOnly)
                     Toggle("Include videos", isOn: $includeVideos)
+                    Toggle("Automatic backup", isOn: $autoBackupEnabled)
+                    DatePicker("Only photos taken after", selection: $autoBackupAfter,
+                               in: ...Date(), displayedComponents: .date)
                 }
                 Section("Originals cache") {
                     Picker("Cache limit", selection: $cacheCapGB) {
@@ -80,17 +86,45 @@ struct SettingsView: View {
                 CacheManager.enforceOriginalsCap(AppSettings.originalsCacheCapBytes)
                 cacheUsage = CacheManager.originalsCacheSize()
             }
+            .onChange(of: autoBackupEnabled) { _, enabled in
+                if enabled {
+                    Task { await store.backupNow() }
+                }
+            }
+            .onChange(of: autoBackupAfter) { _, newValue in
+                AppSettings.autoBackupAfter = newValue
+                store.refreshDeviceItems()
+            }
             .onAppear { cacheUsage = CacheManager.originalsCacheSize() }
             .sheet(isPresented: $showRecovery) {
                 if let recoveryString {
                     RecoverySheet(recoveryString: recoveryString)
                 }
             }
-            .alert("Authentication failed", isPresented: .constant(authError != nil)) {
-                Button("OK") { authError = nil }
+            .alert("Authorization code", isPresented: $showManualCode) {
+                TextField("Code", text: $manualCode)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                Button("Connect") {
+                    let code = manualCode.trimmingCharacters(in: .whitespacesAndNewlines)
+                    manualCode = ""
+                    Task { await submitCode(code) }
+                }
+                Button("Cancel", role: .cancel) { manualCode = "" }
             } message: {
-                Text(authError ?? "")
+                Text("Copy the code HiDrive showed you and paste it here (valid for 5 minutes)")
             }
+        }
+        // HiDrive shows the code on its page ("oob"); closing the sheet leads straight to the code entry.
+        .sheet(item: $signInPage, onDismiss: { showManualCode = true }) { page in
+            SafariView(url: page.url) { signInPage = nil }
+                .ignoresSafeArea()
+        }
+        .alert("Authentication failed",
+               isPresented: Binding(get: { authError != nil }, set: { if !$0 { authError = nil } })) {
+            Button("OK") { authError = nil }
+        } message: {
+            Text(authError ?? "")
         }
     }
 
@@ -103,7 +137,7 @@ struct SettingsView: View {
                 }
             } else {
                 Button {
-                    Task { await connect() }
+                    openSignIn()
                 } label: {
                     if connecting { ProgressView() } else { Text("Connect STRATO HiDrive") }
                 }
@@ -113,37 +147,27 @@ struct SettingsView: View {
                 }
             }
         }
-        .alert("Authorization code", isPresented: $showManualCode) {
-            TextField("Code", text: $manualCode)
-            Button("Connect") {
-                Task { await submitManualCode() }
-            }
-            Button("Cancel", role: .cancel) {}
+    }
+
+    private func openSignIn() {
+        do {
+            signInPage = SignInPage(url: try OAuthWebFlow.authorizeURL())
+        } catch {
+            authError = error.localizedDescription
         }
     }
 
-    private func connect() async {
+    private func submitCode(_ code: String) async {
+        guard !code.isEmpty else { return }
         connecting = true
         defer { connecting = false }
         do {
-            let code = try await OAuthWebFlow.shared.authorize()
             try await HiDriveAuth.shared.exchangeCode(code)
             try await store.client.ensureLayout(deviceId: VaultKeys.deviceId)
             await store.refreshConnectionState()
         } catch {
             authError = "Could not connect: \(error.localizedDescription)"
         }
-    }
-
-    private func submitManualCode() async {
-        do {
-            try await HiDriveAuth.shared.exchangeCode(manualCode.trimmingCharacters(in: .whitespacesAndNewlines))
-            try await store.client.ensureLayout(deviceId: VaultKeys.deviceId)
-            await store.refreshConnectionState()
-        } catch {
-            authError = "Could not connect: \(error.localizedDescription)"
-        }
-        manualCode = ""
     }
 
     private func revealRecovery() async {
@@ -210,7 +234,7 @@ struct CredentialsView: View {
                     .textInputAutocapitalization(.never)
                 SecureField("Client secret", text: $clientSecret)
             } footer: {
-                Text("Register an app at developer.hidrive.com to get these.")
+                Text("Register a \"native\" app with redirect URI \"oob\" at developer.hidrive.com. Stored in this iPhone's Keychain only.")
             }
             Button("Save") {
                 HiDriveAuth.storeCredentials(id: clientId.trimmingCharacters(in: .whitespaces),

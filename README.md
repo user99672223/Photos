@@ -1,10 +1,8 @@
 # PhotoVault
 
-Private, encrypted Google-Photos-style app for iOS. Originals live only in STRATO HiDrive, encrypted client-side.
+Private, encrypted Google-Photos-style iOS app. Originals live only in STRATO HiDrive, encrypted client-side.
 
-**Secrets:** register an app at developer.hidrive.com (redirect `photovault://oauth`), then add repo secrets
-`HIDRIVE_CLIENT_ID` and `HIDRIVE_CLIENT_SECRET` (Settings → Secrets and variables → Actions).
-If the secrets are missing, the app asks for the credentials during onboarding instead.
-
-**IPA:** GitHub Actions → "Build unsigned IPA" → artifact `PhotoVault-unsigned.ipa` (30-day retention).
-Sign and install with AltStore or Sideloadly. Recovery tooling: `tools/pv_decrypt.py`.
+**HiDrive app:** register one at developer.hidrive.com as type "native" with redirect URI "oob". On first launch PhotoVault asks for its client id and secret (change them later under Settings → API credentials); they stay in the iPhone's Keychain and are never part of a build.
+**Sign-in:** after you log in and allow access, HiDrive shows a short code. Copy it and paste it into the app within 5 minutes.
+**Backup:** automatic backup is off by default. When on, it only considers photos taken after the cutoff date (Settings → Backup rules). Back up other items by hand with a day header's "Back up" button or from multi-select.
+**IPA:** GitHub Actions → "Build unsigned IPA" → artifact `PhotoVault-unsigned.ipa` (kept 30 days). Sign and install it with AltStore or Sideloadly. Decrypt blobs offline with `tools/pv_decrypt.py`.

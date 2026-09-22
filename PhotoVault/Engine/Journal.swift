@@ -50,8 +50,11 @@ enum PendingJournal {
         save(entries)
     }
 
-    static func clear() {
-        save([])
+    // Drops only the uploaded prefix; ops appended while the upload was in flight stay pending.
+    static func removeFirst(_ count: Int) {
+        var entries = load()
+        entries.removeFirst(min(count, entries.count))
+        save(entries)
     }
 }
 

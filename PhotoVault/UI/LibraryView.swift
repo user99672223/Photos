@@ -48,14 +48,16 @@ struct FilteredGridView: View {
                     ThumbCell(asset: asset, isSelected: false, selecting: false)
                         .onTapGesture {
                             let index = assets.firstIndex { $0.id == asset.id } ?? 0
-                            viewer = ViewerContext(id: asset.id, assets: assets, index: index)
+                            viewer = ViewerContext(id: asset.id,
+                                                   items: assets.map { TimelineItem.vault($0) },
+                                                   index: index)
                         }
                 }
             }
         }
         .navigationTitle(title)
         .fullScreenCover(item: $viewer) { context in
-            ViewerView(assets: context.assets, startIndex: context.index)
+            ViewerView(items: context.items, startIndex: context.index)
         }
     }
 }

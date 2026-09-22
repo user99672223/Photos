@@ -1,6 +1,6 @@
 import Foundation
-import AuthenticationServices
-import UIKit
+import SwiftUI
+import SafariServices
 
 struct OAuthTokens: Codable {
     var accessToken: String
@@ -15,36 +15,50 @@ struct ClientCredentials {
     var secret: String
 }
 
-enum AuthError: Error {
+enum AuthError: LocalizedError {
     case missingCredentials
     case notConnected
     case badResponse
-    case userCancelled
+    case tokenRequestFailed(status: Int, detail: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingCredentials:
+            return "Enter the HiDrive API credentials first (Settings → API credentials)."
+        case .notConnected:
+            return "Not connected to STRATO HiDrive."
+        case .badResponse:
+            return "Unexpected response from HiDrive."
+        case .tokenRequestFailed(let status, let detail):
+            return detail.isEmpty
+                ? "HiDrive token request failed (HTTP \(status))."
+                : "HiDrive token request failed (HTTP \(status)): \(detail)"
+        }
+    }
 }
 
 let hidriveAuthorizeURL = "https://my.hidrive.com/client/authorize"
 let hidriveTokenURL = "https://my.hidrive.com/oauth2/token"
 let hidriveAPIBase = "https://api.hidrive.strato.com/2.1"
 
+// nil omits redirect_uri, so HiDrive applies the redirect registered for this "native" app ("oob"):
+// after approval the page shows a short code for the user to paste. If the authorize page ever
+// complains, flip this to "oob" or "urn:ietf:wg:oauth:2.0:oob".
+let hidriveRedirectURI: String? = nil
+
 actor HiDriveAuth {
     static let shared = HiDriveAuth()
 
     private var cachedTokens: OAuthTokens?
 
-    // Client id/secret baked in at build time via Info.plist, overridable from the credentials screen.
+    // Only the in-app credentials screen supplies these; nothing is read from the build.
     nonisolated static func credentials() -> ClientCredentials? {
-        if let id = KeychainStore.getString(account: "clientId"),
-           let secret = KeychainStore.getString(account: "clientSecret"),
-           !id.isEmpty, !secret.isEmpty {
-            return ClientCredentials(id: id, secret: secret)
+        guard let id = KeychainStore.getString(account: "clientId"),
+              let secret = KeychainStore.getString(account: "clientSecret"),
+              !id.isEmpty, !secret.isEmpty else {
+            return nil
         }
-        let info = Bundle.main.infoDictionary
-        let id = info?["HiDriveClientID"] as? String ?? ""
-        let secret = info?["HiDriveClientSecret"] as? String ?? ""
-        if !id.isEmpty && !secret.isEmpty {
-            return ClientCredentials(id: id, secret: secret)
-        }
-        return nil
+        return ClientCredentials(id: id, secret: secret)
     }
 
     nonisolated static func storeCredentials(id: String, secret: String) {
@@ -98,10 +112,12 @@ actor HiDriveAuth {
     }
 
     func exchangeCode(_ code: String) async throws {
-        var tokens = try await requestToken(form: [
-            "grant_type": "authorization_code",
-            "code": code
-        ])
+        var form = ["grant_type": "authorization_code", "code": code]
+        // RFC 6749 §4.1.3: the token request must repeat redirect_uri if the authorize request sent one.
+        if let hidriveRedirectURI {
+            form["redirect_uri"] = hidriveRedirectURI
+        }
+        var tokens = try await requestToken(form: form)
         // Resolve alias + home once so all cloud paths are anchored in the user's home.
         if let me = try? await fetchUserInfo(accessToken: tokens.accessToken) {
             tokens.alias = me.alias
@@ -114,6 +130,11 @@ actor HiDriveAuth {
         var access_token: String
         var refresh_token: String?
         var expires_in: Double?
+    }
+
+    private struct TokenErrorResponse: Codable {
+        var error: String?
+        var error_description: String?
     }
 
     private func requestToken(form: [String: String]) async throws -> OAuthTokens {
@@ -129,8 +150,13 @@ actor HiDriveAuth {
             return "\(key)=\(escaped)"
         }.joined(separator: "&").data(using: .utf8)
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw AuthError.badResponse
+        guard let http = response as? HTTPURLResponse else { throw AuthError.badResponse }
+        guard http.statusCode == 200 else {
+            let parsed = try? JSONDecoder().decode(TokenErrorResponse.self, from: data)
+            let detail = [parsed?.error, parsed?.error_description].compactMap { $0 }.joined(separator: ": ")
+            let raw = String(data: data, encoding: .utf8) ?? ""
+            throw AuthError.tokenRequestFailed(status: http.statusCode,
+                                               detail: detail.isEmpty ? String(raw.prefix(200)) : detail)
         }
         let decoded = try JSONDecoder().decode(TokenResponse.self, from: data)
         return OAuthTokens(
@@ -167,43 +193,57 @@ actor HiDriveAuth {
     func accountAlias() -> String? { tokens()?.alias }
 }
 
-// Runs the ASWebAuthenticationSession flow; falls back to manual code paste in the UI if this fails.
-@MainActor
-final class OAuthWebFlow: NSObject, ASWebAuthenticationPresentationContextProviding {
-    static let shared = OAuthWebFlow()
-
-    func authorize() async throws -> String {
+// Authorization-code flow without a redirect back into the app: HiDrive displays the code
+// (valid 5 minutes) and the user pastes it; exchangeCode() then redeems it.
+enum OAuthWebFlow {
+    static func authorizeURL() throws -> URL {
         guard let creds = HiDriveAuth.credentials() else { throw AuthError.missingCredentials }
-        var components = URLComponents(string: hidriveAuthorizeURL)!
-        components.queryItems = [
+        var items = [
             URLQueryItem(name: "client_id", value: creds.id),
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "scope", value: "user,rw"),
-            URLQueryItem(name: "redirect_uri", value: "photovault://oauth")
+            URLQueryItem(name: "scope", value: "user,rw")
         ]
-        let url = components.url!
-        return try await withCheckedThrowingContinuation { continuation in
-            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: "photovault") { callbackURL, error in
-                if let callbackURL,
-                   let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems,
-                   let code = items.first(where: { $0.name == "code" })?.value {
-                    continuation.resume(returning: code)
-                } else if error != nil {
-                    continuation.resume(throwing: AuthError.userCancelled)
-                } else {
-                    continuation.resume(throwing: AuthError.badResponse)
-                }
-            }
-            session.presentationContextProvider = self
-            session.prefersEphemeralWebBrowserSession = false
-            session.start()
+        if let hidriveRedirectURI {
+            items.append(URLQueryItem(name: "redirect_uri", value: hidriveRedirectURI))
         }
+        var components = URLComponents(string: hidriveAuthorizeURL)!
+        components.queryItems = items
+        guard let url = components.url else { throw AuthError.badResponse }
+        return url
+    }
+}
+
+struct SignInPage: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct SafariView: UIViewControllerRepresentable {
+    let url: URL
+    let onFinish: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onFinish: onFinish)
     }
 
-    nonisolated func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        MainActor.assumeIsolated {
-            let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-            return scenes.first?.keyWindow ?? ASPresentationAnchor()
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let controller = SFSafariViewController(url: url)
+        controller.dismissButtonStyle = .done
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: SFSafariViewController, context: Context) {}
+
+    final class Coordinator: NSObject, SFSafariViewControllerDelegate {
+        let onFinish: () -> Void
+
+        init(onFinish: @escaping () -> Void) {
+            self.onFinish = onFinish
+        }
+
+        func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
+            onFinish()
         }
     }
 }

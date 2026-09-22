@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import UIKit
+import AVFoundation
 import UniformTypeIdentifiers
 import CryptoKit
 
@@ -20,20 +21,19 @@ enum PhotoKitExport {
         return status == .authorized || status == .limited
     }
 
-    static func fetchAllAssets(includeVideos: Bool) -> [PHAsset] {
+    // PhotoKit applies the date predicate itself, so older parts of the library are never enumerated.
+    static func fetchAssets(createdAfter cutoff: Date, includeVideos: Bool, newestFirst: Bool) -> PHFetchResult<PHAsset> {
         let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: !newestFirst)]
+        let image = NSNumber(value: PHAssetMediaType.image.rawValue)
+        let video = NSNumber(value: PHAssetMediaType.video.rawValue)
         if includeVideos {
-            options.predicate = NSPredicate(format: "mediaType == %d OR mediaType == %d",
-                                            PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue)
+            options.predicate = NSPredicate(format: "creationDate > %@ AND (mediaType == %@ OR mediaType == %@)",
+                                            cutoff as NSDate, image, video)
         } else {
-            options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+            options.predicate = NSPredicate(format: "creationDate > %@ AND mediaType == %@", cutoff as NSDate, image)
         }
-        let result = PHAsset.fetchAssets(with: options)
-        var assets: [PHAsset] = []
-        assets.reserveCapacity(result.count)
-        result.enumerateObjects { asset, _, _ in assets.append(asset) }
-        return assets
+        return PHAsset.fetchAssets(with: options)
     }
 
     static func fetchAssets(localIdentifiers: [String]) -> [PHAsset] {
@@ -97,6 +97,103 @@ enum PhotoKitExport {
             hasher.update(data: chunk)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+// Media for device items (camera-roll assets not yet in the vault), read straight from the library.
+enum DeviceMedia {
+    static let thumbnails = PHCachingImageManager()
+
+    static func thumbnail(for asset: PHAsset, side: CGFloat) async -> UIImage? {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        let size = CGSize(width: side, height: side)
+        let handle = ImageRequestHandle()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
+                handle.start(continuation) {
+                    DeviceMedia.thumbnails.requestImage(for: asset, targetSize: size, contentMode: .aspectFill,
+                                                        options: options) { image, _ in
+                        handle.finish(image)
+                    }
+                }
+            }
+        } onCancel: {
+            handle.cancel()
+        }
+    }
+
+    static func fullImage(for asset: PHAsset) async -> UIImage? {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = true
+        options.version = .current
+        return await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
+            let once = ResumeGuard()
+            PHImageManager.default().requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
+                guard once.tryResume() else { return }
+                continuation.resume(returning: data.flatMap { UIImage(data: $0) })
+            }
+        }
+    }
+
+    static func playerItem(for asset: PHAsset) async -> AVPlayerItem? {
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .automatic
+        options.version = .current
+        return await withCheckedContinuation { (continuation: CheckedContinuation<AVPlayerItem?, Never>) in
+            let once = ResumeGuard()
+            PHImageManager.default().requestPlayerItem(forVideo: asset, options: options) { item, _ in
+                guard once.tryResume() else { return }
+                continuation.resume(returning: item)
+            }
+        }
+    }
+}
+
+// Bridges a cancellable PHImageManager request to one continuation resume. The handler may fire
+// synchronously inside requestImage, and cancellation may race the start, hence the lock.
+final class ImageRequestHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<UIImage?, Never>?
+    private var requestID: PHImageRequestID?
+    private var cancelled = false
+
+    func start(_ continuation: CheckedContinuation<UIImage?, Never>, request: () -> PHImageRequestID) {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            continuation.resume(returning: nil)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+        let id = request()
+        lock.lock()
+        requestID = id
+        lock.unlock()
+    }
+
+    func finish(_ image: UIImage?) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: image)
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let id = requestID
+        lock.unlock()
+        if let id {
+            DeviceMedia.thumbnails.cancelImageRequest(id)
+        }
+        finish(nil)
     }
 }
 

@@ -6,9 +6,13 @@ struct HiDriveItem {
     var size: Int64
 }
 
-struct HiDriveError: Error {
+struct HiDriveError: LocalizedError {
     var statusCode: Int
     var message: String
+
+    var errorDescription: String? {
+        message.isEmpty ? "HiDrive error \(statusCode)" : "HiDrive error \(statusCode): \(message.prefix(200))"
+    }
 }
 
 // REST client for the HiDrive API. Control-plane calls use a shared session;
@@ -331,5 +335,23 @@ final class HiDriveClient: NSObject, URLSessionDataDelegate, URLSessionDownloadD
         let handler = progressHandlers[downloadTask.taskIdentifier]
         lock.unlock()
         handler?(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    }
+}
+
+enum NetworkProbe {
+    // A request barred from cellular fails at once with networkUnavailableReason == .cellular when
+    // cellular is the only route; any HTTP response means Wi-Fi (or wired) is available.
+    static func isCellularOnly() async -> Bool {
+        var request = URLRequest(url: URL(string: hidriveAPIBase)!, timeoutInterval: 8)
+        request.httpMethod = "HEAD"
+        request.allowsCellularAccess = false
+        do {
+            _ = try await URLSession.shared.data(for: request)
+            return false
+        } catch let error as URLError {
+            return error.networkUnavailableReason == .cellular
+        } catch {
+            return false
+        }
     }
 }

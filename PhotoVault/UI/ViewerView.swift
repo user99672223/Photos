@@ -1,25 +1,29 @@
 import SwiftUI
 import AVKit
+import Photos
 
 struct ViewerView: View {
     @EnvironmentObject var store: VaultStore
     @Environment(\.dismiss) private var dismiss
 
-    let assets: [Asset]
-    @State var startIndex: Int
+    let items: [TimelineItem]
 
-    @State private var currentIndex = 0
+    @State private var currentIndex: Int
     @State private var dragOffset: CGFloat = 0
     @State private var showInfo = false
-    @State private var askCellular = false
-    @State private var appeared = false
+    @State private var cellularPrompt: [PHAsset]?
+
+    init(items: [TimelineItem], startIndex: Int) {
+        self.items = items
+        _currentIndex = State(initialValue: startIndex)
+    }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             TabView(selection: $currentIndex) {
-                ForEach(assets.indices, id: \.self) { index in
-                    AssetPageView(asset: assets[index], isCurrent: index == currentIndex, askCellular: $askCellular)
+                ForEach(items.indices, id: \.self) { index in
+                    page(for: items[index])
                         .tag(index)
                 }
             }
@@ -32,7 +36,7 @@ struct ViewerView: View {
                             dragOffset = value.translation.height
                         }
                     }
-                    .onEnded { value in
+                    .onEnded { _ in
                         if dragOffset > 120 {
                             dismiss()
                         } else {
@@ -54,56 +58,42 @@ struct ViewerView: View {
         }
         .overlay(alignment: .bottom) { bottomBar }
         .sheet(isPresented: $showInfo) {
-            if let asset = currentAsset {
-                InfoSheet(asset: asset)
+            if let item = currentItem {
+                InfoSheet(item: item)
                     .presentationDetents([.medium])
             }
         }
-        .onAppear {
-            if !appeared {
-                appeared = true
-                currentIndex = startIndex
-            }
-        }
+        .cellularBackupPrompt($cellularPrompt)
+        .onAppear { prefetchAround(currentIndex) }
         .onChange(of: currentIndex) { _, newIndex in
             prefetchAround(newIndex)
         }
         .statusBarHidden()
     }
 
-    private var currentAsset: Asset? {
-        assets.indices.contains(currentIndex) ? assets[currentIndex] : nil
+    @ViewBuilder
+    private func page(for item: TimelineItem) -> some View {
+        switch item {
+        case .vault(let asset):
+            AssetPageView(asset: asset)
+        case .device(let asset):
+            DevicePageView(asset: asset)
+        }
+    }
+
+    private var currentItem: TimelineItem? {
+        items.indices.contains(currentIndex) ? items[currentIndex] : nil
     }
 
     private var bottomBar: some View {
         HStack(spacing: 44) {
-            if let asset = currentAsset,
-               let url = CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename) {
-                ShareLink(item: url) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-            } else {
-                Image(systemName: "square.and.arrow.up").opacity(0.3)
-            }
-            Button {
-                if let asset = currentAsset {
-                    store.setFavorite(asset, !asset.isFavorite)
-                }
-            } label: {
-                Image(systemName: currentAsset?.isFavorite == true ? "heart.fill" : "heart")
-            }
-            Button {
-                showInfo = true
-            } label: {
-                Image(systemName: "info.circle")
-            }
-            Button(role: .destructive) {
-                if let asset = currentAsset {
-                    store.moveToTrash([asset])
-                    dismiss()
-                }
-            } label: {
-                Image(systemName: "trash")
+            switch currentItem {
+            case .vault(let asset)?:
+                vaultButtons(asset)
+            case .device(let asset)?:
+                deviceButtons(asset)
+            case nil:
+                EmptyView()
             }
         }
         .font(.title3)
@@ -113,13 +103,60 @@ struct ViewerView: View {
         .background(.ultraThinMaterial)
     }
 
+    @ViewBuilder
+    private func vaultButtons(_ asset: Asset) -> some View {
+        if let url = CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename) {
+            ShareLink(item: url) {
+                Image(systemName: "square.and.arrow.up")
+            }
+        } else {
+            Image(systemName: "square.and.arrow.up").opacity(0.3)
+        }
+        Button {
+            store.setFavorite(asset, !asset.isFavorite)
+        } label: {
+            Image(systemName: asset.isFavorite ? "heart.fill" : "heart")
+        }
+        Button {
+            showInfo = true
+        } label: {
+            Image(systemName: "info.circle")
+        }
+        Button(role: .destructive) {
+            store.moveToTrash([asset])
+            dismiss()
+        } label: {
+            Image(systemName: "trash")
+        }
+    }
+
+    @ViewBuilder
+    private func deviceButtons(_ asset: PHAsset) -> some View {
+        let id = asset.localIdentifier
+        if store.isInVault(sourceId: id) {
+            Label("Backed up", systemImage: "checkmark.icloud")
+        } else if store.queuedSourceIds.contains(id) {
+            ProgressView().tint(.white)
+        } else {
+            Button {
+                requestManualBackup([asset], store: store, prompt: $cellularPrompt)
+            } label: {
+                Label("Back up", systemImage: "icloud.and.arrow.up")
+            }
+        }
+        Button {
+            showInfo = true
+        } label: {
+            Image(systemName: "info.circle")
+        }
+    }
+
     private func prefetchAround(_ index: Int) {
         guard AppSettings.cellularPolicy != .ask else { return }
         let allowsCellular = AppSettings.cellularPolicy == .always
         for offset in [-2, -1, 1, 2] {
             let neighbor = index + offset
-            guard assets.indices.contains(neighbor) else { continue }
-            let asset = assets[neighbor]
+            guard items.indices.contains(neighbor), case .vault(let asset) = items[neighbor] else { continue }
             guard CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename) == nil else { continue }
             Task {
                 _ = try? await store.downloadOriginal(asset, allowsCellular: allowsCellular)
@@ -128,16 +165,14 @@ struct ViewerView: View {
     }
 }
 
-// One page: shows the cached thumbnail immediately, swaps in the decrypted original.
+// Vault page: shows the cached thumbnail immediately, swaps in the decrypted original.
 struct AssetPageView: View {
     @EnvironmentObject var store: VaultStore
     let asset: Asset
-    let isCurrent: Bool
-    @Binding var askCellular: Bool
 
     @State private var thumb: UIImage?
     @State private var fullImage: UIImage?
-    @State private var videoURL: URL?
+    @State private var player: AVPlayer?
     @State private var progress: Double = 0
     @State private var loading = false
     @State private var failed = false
@@ -145,8 +180,8 @@ struct AssetPageView: View {
 
     var body: some View {
         ZStack {
-            if let videoURL {
-                VideoPlayer(player: AVPlayer(url: videoURL))
+            if let player {
+                VideoPlayer(player: player)
             } else if let fullImage {
                 ZoomableImage(image: fullImage)
             } else if let thumb {
@@ -179,6 +214,7 @@ struct AssetPageView: View {
             thumb = UIImage(contentsOfFile: CacheManager.thumbURL(assetId: asset.id).path)
             await startLoad()
         }
+        .onDisappear { player?.pause() }
         .confirmationDialog("Download original over cellular?", isPresented: $showCellularPrompt, titleVisibility: .visible) {
             Button("Download") {
                 Task { await loadOriginal(allowsCellular: true) }
@@ -208,12 +244,70 @@ struct AssetPageView: View {
                 Task { @MainActor in progress = value }
             }
             if asset.isVideo {
-                videoURL = url
+                player = AVPlayer(url: url)
             } else {
                 let loaded = await Task.detached { UIImage(contentsOfFile: url.path) }.value
                 fullImage = loaded
             }
         } catch {
+            failed = true
+        }
+    }
+}
+
+// Device page: full-quality image or video straight from the photo library, no cloud involved.
+struct DevicePageView: View {
+    let asset: PHAsset
+
+    @State private var preview: UIImage?
+    @State private var fullImage: UIImage?
+    @State private var player: AVPlayer?
+    @State private var loading = false
+    @State private var failed = false
+
+    var body: some View {
+        ZStack {
+            if let player {
+                VideoPlayer(player: player)
+            } else if let fullImage {
+                ZoomableImage(image: fullImage)
+            } else if let preview {
+                Image(uiImage: preview)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                Image(systemName: "photo")
+                    .font(.largeTitle)
+                    .foregroundStyle(.secondary)
+            }
+            if loading {
+                ProgressView().tint(.white)
+            }
+            if failed {
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                    Text("Could not load from the photo library").font(.caption)
+                }
+                .foregroundStyle(.white)
+            }
+        }
+        .task(id: asset.localIdentifier) { await load() }
+        .onDisappear { player?.pause() }
+    }
+
+    private func load() async {
+        preview = await DeviceMedia.thumbnail(for: asset, side: 512)
+        loading = true
+        defer { loading = false }
+        if asset.mediaType == .video {
+            if let item = await DeviceMedia.playerItem(for: asset) {
+                player = AVPlayer(playerItem: item)
+            } else {
+                failed = true
+            }
+        } else if let image = await DeviceMedia.fullImage(for: asset) {
+            fullImage = image
+        } else {
             failed = true
         }
     }
@@ -275,18 +369,27 @@ struct ZoomableImage: View {
 }
 
 struct InfoSheet: View {
-    let asset: Asset
+    let item: TimelineItem
 
     var body: some View {
         NavigationStack {
             List {
-                LabeledContent("Date", value: asset.captured.formatted(date: .abbreviated, time: .shortened))
-                LabeledContent("Resolution", value: "\(asset.width) × \(asset.height)")
-                if asset.isVideo {
-                    LabeledContent("Duration", value: formatDuration(asset.duration))
+                switch item {
+                case .vault(let asset):
+                    LabeledContent("Date", value: asset.captured.formatted(date: .abbreviated, time: .shortened))
+                    LabeledContent("Resolution", value: "\(asset.width) × \(asset.height)")
+                    if asset.isVideo {
+                        LabeledContent("Duration", value: formatDuration(asset.duration))
+                    }
+                    LabeledContent("File size", value: ByteCountFormatter.string(fromByteCount: asset.bytes, countStyle: .file))
+                    LabeledContent("Filename", value: asset.filename)
+                case .device(let asset):
+                    LabeledContent("Date", value: asset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")
+                    LabeledContent("Resolution", value: "\(asset.pixelWidth) × \(asset.pixelHeight)")
+                    if asset.mediaType == .video {
+                        LabeledContent("Duration", value: formatDuration(asset.duration))
+                    }
                 }
-                LabeledContent("File size", value: ByteCountFormatter.string(fromByteCount: asset.bytes, countStyle: .file))
-                LabeledContent("Filename", value: asset.filename)
             }
             .navigationTitle("Info")
             .navigationBarTitleDisplayMode(.inline)

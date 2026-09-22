@@ -69,6 +69,7 @@ struct PhotoVaultApp: App {
             case .active:
                 guard store.onboarded else { return }
                 store.startObservingLibraryIfAuthorized()
+                store.refreshDeviceItems()
                 Task {
                     await store.syncNow()
                     await store.backupNow()

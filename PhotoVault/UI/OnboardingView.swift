@@ -10,6 +10,7 @@ struct OnboardingView: View {
         case credentials
         case connect
         case photos
+        case backupPolicy
         case restoring
     }
 
@@ -23,8 +24,11 @@ struct OnboardingView: View {
     @State private var clientSecret = ""
     @State private var connecting = false
     @State private var connectError: String?
+    @State private var signInPage: SignInPage?
     @State private var manualCode = ""
     @State private var showManualCode = false
+    @State private var autoBackupEnabled = false
+    @State private var autoBackupAfter = Date()
 
     var body: some View {
         NavigationStack {
@@ -36,6 +40,7 @@ struct OnboardingView: View {
                 case .credentials: credentials
                 case .connect: connect
                 case .photos: photos
+                case .backupPolicy: backupPolicy
                 case .restoring: restoring
                 }
             }
@@ -62,6 +67,8 @@ struct OnboardingView: View {
                 let key = VaultKeys.masterKey ?? VaultKeys.createMasterKey()
                 newKey = key
                 isRestoreFlow = false
+                AppSettings.autoBackupAfter = Date()
+                autoBackupAfter = Date()
                 step = .createVault
             }
             .buttonStyle(.borderedProminent)
@@ -123,6 +130,8 @@ struct OnboardingView: View {
             Button("Continue") {
                 if VaultKeys.restoreMasterKey(recoveryString: restoreInput) != nil {
                     store.hasVault = true
+                    AppSettings.autoBackupAfter = Date()
+                    autoBackupAfter = Date()
                     afterVaultStep()
                 } else {
                     restoreError = "That doesn't look like a valid recovery string."
@@ -138,7 +147,7 @@ struct OnboardingView: View {
     private var credentials: some View {
         VStack(spacing: 20) {
             Text("HiDrive API credentials").font(.title2.bold())
-            Text("This build has no embedded credentials. Register an app at developer.hidrive.com and paste its client id and secret.")
+            Text("Register an app at developer.hidrive.com (type \"native\", redirect URI \"oob\") and paste its client id and secret. They are stored in this iPhone's Keychain only.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             TextField("Client ID", text: $clientId)
@@ -166,11 +175,15 @@ struct OnboardingView: View {
                 .font(.system(size: 56))
                 .foregroundStyle(.tint)
             Text("Connect STRATO HiDrive").font(.title2.bold())
+            Text("Sign in and allow access. HiDrive then shows a short code: copy it, tap Done, and paste it here.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
             if let connectError {
                 Text(connectError).font(.caption).foregroundStyle(.red)
             }
             Button {
-                Task { await startOAuth() }
+                openSignIn()
             } label: {
                 if connecting { ProgressView() } else { Text("Sign in") }
             }
@@ -182,31 +195,44 @@ struct OnboardingView: View {
             }
             Spacer()
         }
+        // HiDrive shows the code on its page ("oob"); closing the sheet leads straight to the code entry.
+        .sheet(item: $signInPage, onDismiss: { showManualCode = true }) { page in
+            SafariView(url: page.url) { signInPage = nil }
+                .ignoresSafeArea()
+        }
         .alert("Authorization code", isPresented: $showManualCode) {
             TextField("Code", text: $manualCode)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
             Button("Connect") {
-                Task { await finishConnect(code: manualCode.trimmingCharacters(in: .whitespacesAndNewlines)) }
+                let code = manualCode.trimmingCharacters(in: .whitespacesAndNewlines)
+                manualCode = ""
+                Task { await finishConnect(code: code) }
             }
-            Button("Cancel", role: .cancel) {}
+            Button("Cancel", role: .cancel) { manualCode = "" }
+        } message: {
+            Text("Copy the code HiDrive showed you and paste it here (valid for 5 minutes)")
         }
     }
 
-    private func startOAuth() async {
-        connecting = true
-        defer { connecting = false }
+    private func openSignIn() {
+        connectError = nil
         do {
-            let code = try await OAuthWebFlow.shared.authorize()
-            await finishConnect(code: code)
+            signInPage = SignInPage(url: try OAuthWebFlow.authorizeURL())
         } catch {
-            connectError = "Sign-in was cancelled or failed. You can paste the authorization code manually."
+            connectError = error.localizedDescription
         }
     }
 
     private func finishConnect(code: String) async {
+        guard !code.isEmpty else { return }
+        connecting = true
+        defer { connecting = false }
         do {
             try await HiDriveAuth.shared.exchangeCode(code)
             try await store.client.ensureLayout(deviceId: VaultKeys.deviceId)
             await store.refreshConnectionState()
+            connectError = nil
             step = .photos
         } catch {
             connectError = "Could not connect: \(error.localizedDescription)"
@@ -227,13 +253,40 @@ struct OnboardingView: View {
             Button("Allow access") {
                 Task {
                     _ = await PhotoKitExport.requestAuthorization()
-                    if isRestoreFlow {
-                        step = .restoring
+                    step = .backupPolicy
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            Spacer()
+        }
+    }
+
+    private var backupPolicy: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "arrow.triangle.2.circlepath.icloud")
+                .font(.system(size: 56))
+                .foregroundStyle(.tint)
+            Text("Automatic backup").font(.title2.bold())
+            Text("Camera-roll photos taken before this date are neither shown nor backed up. Anything newer can be backed up automatically, or by hand from the timeline. You can change both later in Settings.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Toggle("Automatic backup", isOn: $autoBackupEnabled)
+            DatePicker("Only photos taken after", selection: $autoBackupAfter,
+                       in: ...Date(), displayedComponents: .date)
+            Button("Continue") {
+                AppSettings.autoBackupEnabled = autoBackupEnabled
+                AppSettings.autoBackupAfter = autoBackupAfter
+                if isRestoreFlow {
+                    step = .restoring
+                    Task {
                         await store.syncNow()
                         finish()
-                    } else {
-                        finish()
                     }
+                } else {
+                    finish()
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -261,6 +314,7 @@ struct OnboardingView: View {
         AppSettings.onboardingComplete = true
         store.onboarded = true
         store.startObservingLibraryIfAuthorized()
+        store.refreshDeviceItems()
         Task { await store.backupNow() }
     }
 }
