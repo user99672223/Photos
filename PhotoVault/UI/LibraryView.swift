@@ -3,20 +3,16 @@ import SwiftData
 import Photos
 
 struct LibraryView: View {
-    @Query(sort: \Asset.captured, order: .reverse) private var allAssets: [Asset]
-
     var body: some View {
         NavigationStack {
             List {
                 NavigationLink {
-                    FilteredGridView(title: "Favorites",
-                                     assets: allAssets.filter { $0.isFavorite && !$0.isDeleted })
+                    FilteredGridView(title: "Favorites", filter: .favorites)
                 } label: {
                     Label("Favorites", systemImage: "heart")
                 }
                 NavigationLink {
-                    FilteredGridView(title: "Videos",
-                                     assets: allAssets.filter { $0.isVideo && !$0.isDeleted })
+                    FilteredGridView(title: "Videos", filter: .videos)
                 } label: {
                     Label("Videos", systemImage: "video")
                 }
@@ -36,26 +32,39 @@ struct LibraryView: View {
     }
 }
 
+// Filtered lists come from the in-memory index, recomputed off-main when the timeline changes.
 struct FilteredGridView: View {
+    @EnvironmentObject var store: VaultStore
     let title: String
-    let assets: [Asset]
+    let filter: LibraryFilter
+    @State private var items: [TimelineItem] = []
     @State private var viewer: ViewerContext?
 
+    private let spacing: CGFloat = 2
+
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: 3), spacing: 2) {
-                ForEach(assets, id: \.id) { asset in
-                    ThumbCell(asset: asset, isSelected: false, selecting: false)
-                        .onTapGesture {
-                            let index = assets.firstIndex { $0.id == asset.id } ?? 0
-                            viewer = ViewerContext(id: asset.id,
-                                                   items: assets.map { TimelineItem.vault($0) },
-                                                   index: index)
-                        }
+        GeometryReader { geo in
+            let side = max(1, (geo.size.width - spacing * 2) / 3)
+            ScrollView {
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(side), spacing: spacing), count: 3), spacing: spacing) {
+                    ForEach(items) { item in
+                        TimelineCell(item: item, side: side, isSelected: false, selecting: false, reportsVisibility: false)
+                            .onTapGesture {
+                                viewer = ViewerContext(id: item.id, items: items, index: item.flatIndex)
+                            }
+                    }
+                }
+                if items.isEmpty {
+                    Text("Nothing here yet")
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 80)
                 }
             }
         }
         .navigationTitle(title)
+        .task(id: store.timeline.generation) {
+            items = await store.index.filtered(filter)
+        }
         .fullScreenCover(item: $viewer) { context in
             ViewerView(items: context.items, startIndex: context.index)
         }
@@ -75,8 +84,7 @@ struct TrashView: View {
             }
             ForEach(trashed, id: \.id) { asset in
                 HStack(spacing: 12) {
-                    ThumbCell(asset: asset, isSelected: false, selecting: false)
-                        .frame(width: 56, height: 56)
+                    ThumbCell(item: TimelineItem.vault(asset, flatIndex: 0), side: 56, reportsVisibility: false)
                     VStack(alignment: .leading) {
                         Text(asset.filename).font(.caption).lineLimit(1)
                         Text("\(daysRemaining(asset)) days remaining")
@@ -137,14 +145,13 @@ struct FreeUpSpaceView: View {
             }
         }
         .navigationTitle("Free up space")
-        .task { refresh() }
+        .task { await refresh() }
     }
 
-    private func refresh() {
-        let backedUp = store.allAssets().filter { $0.backedUp && !$0.sourceAssetId.isEmpty && !$0.isDeleted }
-        var bytesBySource: [String: Int64] = [:]
-        for asset in backedUp { bytesBySource[asset.sourceAssetId] = asset.bytes }
-        let found = PhotoKitExport.fetchAssets(localIdentifiers: Array(bytesBySource.keys))
+    private func refresh() async {
+        let bytesBySource = await store.index.backedUpSources()
+        let ids = Array(bytesBySource.keys)
+        let found = await Task.detached { PhotoKitExport.fetchAssets(localIdentifiers: ids) }.value
         candidates = found
         totalBytes = found.reduce(0) { $0 + (bytesBySource[$1.localIdentifier] ?? 0) }
     }
@@ -157,7 +164,7 @@ struct FreeUpSpaceView: View {
         }) { _, _ in
             Task { @MainActor in
                 working = false
-                refresh()
+                await refresh()
             }
         }
     }

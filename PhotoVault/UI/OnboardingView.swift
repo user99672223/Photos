@@ -232,6 +232,7 @@ struct OnboardingView: View {
             try await HiDriveAuth.shared.exchangeCode(code)
             try await store.client.ensureLayout(deviceId: VaultKeys.deviceId)
             await store.refreshConnectionState()
+            await store.configureFetcher()
             connectError = nil
             step = .photos
         } catch {
@@ -300,12 +301,15 @@ struct OnboardingView: View {
             Spacer()
             ProgressView()
             Text("Rebuilding your library…").font(.headline)
-            if store.restoreTotal > 0 {
-                ProgressView(value: Double(store.restoreDone), total: Double(max(store.restoreTotal, 1)))
-                Text("\(store.restoreDone) of \(store.restoreTotal) thumbnails")
+            if store.syncTotal > 0 {
+                ProgressView(value: Double(store.syncDone), total: Double(max(store.syncTotal, 1)))
+                Text("Syncing \(store.syncDone)/\(store.syncTotal) journal files")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Text("Thumbnails load as you scroll and fill in over time.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Spacer()
         }
     }
@@ -314,7 +318,10 @@ struct OnboardingView: View {
         AppSettings.onboardingComplete = true
         store.onboarded = true
         store.startObservingLibraryIfAuthorized()
-        store.refreshDeviceItems()
-        Task { await store.backupNow() }
+        Task {
+            await store.refreshDeviceItems()
+            await store.backupNow()
+            store.startWarmupIfAllowed()
+        }
     }
 }

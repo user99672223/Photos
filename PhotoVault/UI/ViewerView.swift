@@ -2,6 +2,8 @@ import SwiftUI
 import AVKit
 import Photos
 
+// Pages through the timeline's flat order; only a window of pages around the current one exists,
+// widened as the user swipes, so a 50k-item library never materialises 50k pages.
 struct ViewerView: View {
     @EnvironmentObject var store: VaultStore
     @Environment(\.dismiss) private var dismiss
@@ -9,41 +11,50 @@ struct ViewerView: View {
     let items: [TimelineItem]
 
     @State private var currentIndex: Int
+    @State private var windowLow: Int
+    @State private var windowHigh: Int
     @State private var dragOffset: CGFloat = 0
     @State private var showInfo = false
     @State private var cellularPrompt: [PHAsset]?
+    @State private var favoriteOverrides: [String: Bool] = [:]
 
     init(items: [TimelineItem], startIndex: Int) {
         self.items = items
-        _currentIndex = State(initialValue: startIndex)
+        let last = max(items.count - 1, 0)
+        let start = min(max(startIndex, 0), last)
+        _currentIndex = State(initialValue: start)
+        _windowLow = State(initialValue: max(0, start - 8))
+        _windowHigh = State(initialValue: min(last, start + 8))
     }
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            TabView(selection: $currentIndex) {
-                ForEach(items.indices, id: \.self) { index in
-                    page(for: items[index])
-                        .tag(index)
+            if !items.isEmpty {
+                TabView(selection: $currentIndex) {
+                    ForEach(Array(windowLow...windowHigh), id: \.self) { index in
+                        page(for: items[index])
+                            .tag(index)
+                    }
                 }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .offset(y: dragOffset)
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 20)
+                        .onChanged { value in
+                            if abs(value.translation.height) > abs(value.translation.width) && value.translation.height > 0 {
+                                dragOffset = value.translation.height
+                            }
+                        }
+                        .onEnded { _ in
+                            if dragOffset > 120 {
+                                dismiss()
+                            } else {
+                                dragOffset = 0
+                            }
+                        }
+                )
             }
-            .tabViewStyle(.page(indexDisplayMode: .never))
-            .offset(y: dragOffset)
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 20)
-                    .onChanged { value in
-                        if abs(value.translation.height) > abs(value.translation.width) && value.translation.height > 0 {
-                            dragOffset = value.translation.height
-                        }
-                    }
-                    .onEnded { _ in
-                        if dragOffset > 120 {
-                            dismiss()
-                        } else {
-                            dragOffset = 0
-                        }
-                    }
-            )
         }
         .overlay(alignment: .topLeading) {
             Button {
@@ -66,6 +77,8 @@ struct ViewerView: View {
         .cellularBackupPrompt($cellularPrompt)
         .onAppear { prefetchAround(currentIndex) }
         .onChange(of: currentIndex) { _, newIndex in
+            if newIndex - windowLow < 3 { windowLow = max(0, windowLow - 12) }
+            if windowHigh - newIndex < 3 { windowHigh = min(items.count - 1, windowHigh + 12) }
             prefetchAround(newIndex)
         }
         .statusBarHidden()
@@ -73,11 +86,10 @@ struct ViewerView: View {
 
     @ViewBuilder
     private func page(for item: TimelineItem) -> some View {
-        switch item {
-        case .vault(let asset):
-            AssetPageView(asset: asset)
-        case .device(let asset):
-            DevicePageView(asset: asset)
+        if let phAsset = item.phAsset {
+            DevicePageView(asset: phAsset)
+        } else {
+            AssetPageView(item: item)
         }
     }
 
@@ -87,13 +99,12 @@ struct ViewerView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 44) {
-            switch currentItem {
-            case .vault(let asset)?:
-                vaultButtons(asset)
-            case .device(let asset)?:
-                deviceButtons(asset)
-            case nil:
-                EmptyView()
+            if let item = currentItem {
+                if let phAsset = item.phAsset {
+                    DeviceButtons(asset: phAsset, showInfo: $showInfo, cellularPrompt: $cellularPrompt)
+                } else {
+                    vaultButtons(item)
+                }
             }
         }
         .font(.title3)
@@ -104,8 +115,9 @@ struct ViewerView: View {
     }
 
     @ViewBuilder
-    private func vaultButtons(_ asset: Asset) -> some View {
-        if let url = CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename) {
+    private func vaultButtons(_ item: TimelineItem) -> some View {
+        let favorite = favoriteOverrides[item.assetId] ?? item.isFavorite
+        if let url = CacheManager.cachedOriginal(assetId: item.assetId, filename: item.filename) {
             ShareLink(item: url) {
                 Image(systemName: "square.and.arrow.up")
             }
@@ -113,9 +125,10 @@ struct ViewerView: View {
             Image(systemName: "square.and.arrow.up").opacity(0.3)
         }
         Button {
-            store.setFavorite(asset, !asset.isFavorite)
+            favoriteOverrides[item.assetId] = !favorite
+            store.setFavorite(ids: [item.assetId], !favorite)
         } label: {
-            Image(systemName: asset.isFavorite ? "heart.fill" : "heart")
+            Image(systemName: favorite ? "heart.fill" : "heart")
         }
         Button {
             showInfo = true
@@ -123,31 +136,10 @@ struct ViewerView: View {
             Image(systemName: "info.circle")
         }
         Button(role: .destructive) {
-            store.moveToTrash([asset])
+            store.moveToTrash(ids: [item.assetId])
             dismiss()
         } label: {
             Image(systemName: "trash")
-        }
-    }
-
-    @ViewBuilder
-    private func deviceButtons(_ asset: PHAsset) -> some View {
-        let id = asset.localIdentifier
-        if store.isInVault(sourceId: id) {
-            Label("Backed up", systemImage: "checkmark.icloud")
-        } else if store.queuedSourceIds.contains(id) {
-            ProgressView().tint(.white)
-        } else {
-            Button {
-                requestManualBackup([asset], store: store, prompt: $cellularPrompt)
-            } label: {
-                Label("Back up", systemImage: "icloud.and.arrow.up")
-            }
-        }
-        Button {
-            showInfo = true
-        } label: {
-            Image(systemName: "info.circle")
         }
     }
 
@@ -156,8 +148,10 @@ struct ViewerView: View {
         let allowsCellular = AppSettings.cellularPolicy == .always
         for offset in [-2, -1, 1, 2] {
             let neighbor = index + offset
-            guard items.indices.contains(neighbor), case .vault(let asset) = items[neighbor] else { continue }
-            guard CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename) == nil else { continue }
+            guard items.indices.contains(neighbor), !items[neighbor].isDevice else { continue }
+            let item = items[neighbor]
+            guard CacheManager.cachedOriginal(assetId: item.assetId, filename: item.filename) == nil else { continue }
+            guard let asset = store.asset(byId: item.assetId) else { continue }
             Task {
                 _ = try? await store.downloadOriginal(asset, allowsCellular: allowsCellular)
             }
@@ -165,10 +159,44 @@ struct ViewerView: View {
     }
 }
 
-// Vault page: shows the cached thumbnail immediately, swaps in the decrypted original.
+struct DeviceButtons: View {
+    @EnvironmentObject var store: VaultStore
+    let asset: PHAsset
+    @Binding var showInfo: Bool
+    @Binding var cellularPrompt: [PHAsset]?
+    @State private var inVault = false
+
+    var body: some View {
+        let id = asset.localIdentifier
+        let queued = store.queuedSourceIds.contains(id)
+        Group {
+            if inVault {
+                Label("Backed up", systemImage: "checkmark.icloud")
+            } else if queued {
+                ProgressView().tint(.white)
+            } else {
+                Button {
+                    requestManualBackup([asset], store: store, prompt: $cellularPrompt)
+                } label: {
+                    Label("Back up", systemImage: "icloud.and.arrow.up")
+                }
+            }
+        }
+        .task(id: "\(id)|\(queued)") {
+            inVault = await store.index.isKnownSource(id)
+        }
+        Button {
+            showInfo = true
+        } label: {
+            Image(systemName: "info.circle")
+        }
+    }
+}
+
+// Vault page: shows the thumbnail immediately, swaps in the decrypted original.
 struct AssetPageView: View {
     @EnvironmentObject var store: VaultStore
-    let asset: Asset
+    let item: TimelineItem
 
     @State private var thumb: UIImage?
     @State private var fullImage: UIImage?
@@ -210,8 +238,13 @@ struct AssetPageView: View {
                 .foregroundStyle(.white)
             }
         }
-        .task(id: asset.id) {
-            thumb = UIImage(contentsOfFile: CacheManager.thumbURL(assetId: asset.id).path)
+        .task(id: item.id) {
+            if let cached = ThumbnailMemoryCache.shared.image(item.assetId) {
+                thumb = cached
+            } else {
+                let path = CacheManager.thumbURL(assetId: item.assetId).path
+                thumb = await Task.detached { UIImage(contentsOfFile: path) }.value
+            }
             await startLoad()
         }
         .onDisappear { player?.pause() }
@@ -227,7 +260,7 @@ struct AssetPageView: View {
     }
 
     private func startLoad() async {
-        if CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename) == nil
+        if CacheManager.cachedOriginal(assetId: item.assetId, filename: item.filename) == nil
             && AppSettings.cellularPolicy == .ask {
             showCellularPrompt = true
             return
@@ -237,13 +270,17 @@ struct AssetPageView: View {
 
     private func loadOriginal(allowsCellular: Bool) async {
         guard !loading else { return }
+        guard let asset = store.asset(byId: item.assetId) else {
+            failed = true
+            return
+        }
         loading = true
         defer { loading = false }
         do {
             let url = try await store.downloadOriginal(asset, allowsCellular: allowsCellular) { value in
                 Task { @MainActor in progress = value }
             }
-            if asset.isVideo {
+            if item.isVideo {
                 player = AVPlayer(url: url)
             } else {
                 let loaded = await Task.detached { UIImage(contentsOfFile: url.path) }.value
@@ -369,30 +406,40 @@ struct ZoomableImage: View {
 }
 
 struct InfoSheet: View {
+    @EnvironmentObject var store: VaultStore
     let item: TimelineItem
+    @State private var asset: Asset?
 
     var body: some View {
         NavigationStack {
             List {
-                switch item {
-                case .vault(let asset):
-                    LabeledContent("Date", value: asset.captured.formatted(date: .abbreviated, time: .shortened))
-                    LabeledContent("Resolution", value: "\(asset.width) × \(asset.height)")
-                    if asset.isVideo {
-                        LabeledContent("Duration", value: formatDuration(asset.duration))
+                if let phAsset = item.phAsset {
+                    LabeledContent("Date", value: phAsset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")
+                    LabeledContent("Resolution", value: "\(phAsset.pixelWidth) × \(phAsset.pixelHeight)")
+                    if phAsset.mediaType == .video {
+                        LabeledContent("Duration", value: formatDuration(phAsset.duration))
                     }
-                    LabeledContent("File size", value: ByteCountFormatter.string(fromByteCount: asset.bytes, countStyle: .file))
-                    LabeledContent("Filename", value: asset.filename)
-                case .device(let asset):
-                    LabeledContent("Date", value: asset.creationDate?.formatted(date: .abbreviated, time: .shortened) ?? "Unknown")
-                    LabeledContent("Resolution", value: "\(asset.pixelWidth) × \(asset.pixelHeight)")
-                    if asset.mediaType == .video {
-                        LabeledContent("Duration", value: formatDuration(asset.duration))
+                } else {
+                    LabeledContent("Date", value: item.date.formatted(date: .abbreviated, time: .shortened))
+                    if let asset {
+                        LabeledContent("Resolution", value: "\(asset.width) × \(asset.height)")
                     }
+                    if item.isVideo {
+                        LabeledContent("Duration", value: formatDuration(item.duration))
+                    }
+                    if let asset {
+                        LabeledContent("File size", value: ByteCountFormatter.string(fromByteCount: asset.bytes, countStyle: .file))
+                    }
+                    LabeledContent("Filename", value: item.filename)
                 }
             }
             .navigationTitle("Info")
             .navigationBarTitleDisplayMode(.inline)
+        }
+        .task(id: item.id) {
+            if !item.isDevice {
+                asset = store.asset(byId: item.assetId)
+            }
         }
     }
 }

@@ -18,6 +18,9 @@ struct SettingsView: View {
     @State private var signInPage: SignInPage?
     @State private var manualCode = ""
     @State private var showManualCode = false
+    @State private var confirmRebuild = false
+    @State private var diagnostics = DiagnosticsSnapshot()
+    @State private var diagnosticsTick = 0
 
     var body: some View {
         NavigationStack {
@@ -58,21 +61,9 @@ struct SettingsView: View {
                         Task { await revealRecovery() }
                     }
                 }
-                Section {
-                    Button {
-                        Task {
-                            await store.syncNow()
-                            await store.backupNow(force: true)
-                        }
-                    } label: {
-                        if store.isSyncing {
-                            HStack { Text("Syncing…"); Spacer(); ProgressView() }
-                        } else {
-                            Text("Sync now")
-                        }
-                    }
-                    .disabled(store.isSyncing)
-                }
+                syncSection
+                maintenanceSection
+                diagnosticsSection
                 Section {
                     LabeledContent("Version", value: appVersion)
                     if let error = store.lastError {
@@ -83,8 +74,11 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .onChange(of: cacheCapGB) { _, newValue in
                 AppSettings.originalsCacheCapBytes = Int64(newValue * 1_000_000_000)
-                CacheManager.enforceOriginalsCap(AppSettings.originalsCacheCapBytes)
-                cacheUsage = CacheManager.originalsCacheSize()
+                let cap = AppSettings.originalsCacheCapBytes
+                Task {
+                    await Task.detached { CacheManager.enforceOriginalsCap(cap) }.value
+                    cacheUsage = await Task.detached { CacheManager.originalsCacheSize() }.value
+                }
             }
             .onChange(of: autoBackupEnabled) { _, enabled in
                 if enabled {
@@ -93,9 +87,15 @@ struct SettingsView: View {
             }
             .onChange(of: autoBackupAfter) { _, newValue in
                 AppSettings.autoBackupAfter = newValue
-                store.refreshDeviceItems()
+                Task { await store.refreshDeviceItems() }
             }
-            .onAppear { cacheUsage = CacheManager.originalsCacheSize() }
+            .task {
+                cacheUsage = await Task.detached { CacheManager.originalsCacheSize() }.value
+            }
+            .task(id: diagnosticsTick) {
+                diagnostics = await store.diagnostics()
+            }
+            .onAppear { diagnosticsTick += 1 }
             .sheet(isPresented: $showRecovery) {
                 if let recoveryString {
                     RecoverySheet(recoveryString: recoveryString)
@@ -113,6 +113,14 @@ struct SettingsView: View {
                 Button("Cancel", role: .cancel) { manualCode = "" }
             } message: {
                 Text("Copy the code HiDrive showed you and paste it here (valid for 5 minutes)")
+            }
+            .confirmationDialog("Rebuild local index?", isPresented: $confirmRebuild, titleVisibility: .visible) {
+                Button("Rebuild", role: .destructive) {
+                    Task { await store.rebuildLocalIndex() }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Deletes the local index and cached thumbnails on this iPhone, then downloads the journal again. Your vault key, sign-in and settings are kept. Nothing in the cloud changes.")
             }
         }
         // HiDrive shows the code on its page ("oob"); closing the sheet leads straight to the code entry.
@@ -149,6 +157,70 @@ struct SettingsView: View {
         }
     }
 
+    private var syncSection: some View {
+        Section {
+            Button {
+                Task {
+                    await store.syncNow()
+                    await store.backupNow(force: true)
+                    store.startWarmupIfAllowed()
+                    diagnosticsTick += 1
+                }
+            } label: {
+                if store.isSyncing {
+                    HStack {
+                        Text("Syncing \(store.syncDone)/\(store.syncTotal)")
+                        Spacer()
+                        ProgressView()
+                    }
+                } else {
+                    Text("Sync now")
+                }
+            }
+            .disabled(store.isSyncing || store.isRebuilding)
+        }
+    }
+
+    private var maintenanceSection: some View {
+        Section {
+            Button("Rebuild local index", role: .destructive) {
+                confirmRebuild = true
+            }
+            .disabled(store.isSyncing || store.isRebuilding || store.isBackingUp)
+            if store.isRebuilding {
+                HStack {
+                    Text("Rebuilding…")
+                    Spacer()
+                    ProgressView()
+                }
+            }
+        } header: {
+            Text("Maintenance")
+        } footer: {
+            Text("Use this if the library looks incomplete or the app was interrupted during a sync.")
+        }
+    }
+
+    private var diagnosticsSection: some View {
+        Section("Diagnostics") {
+            LabeledContent("Assets", value: "\(diagnostics.liveAssets) (+\(diagnostics.deletedAssets) in trash)")
+            LabeledContent("Sections", value: "\(diagnostics.sections)")
+            LabeledContent("Thumbnails cached", value: "\(diagnostics.thumbsCached) / \(diagnostics.liveAssets + diagnostics.deletedAssets)")
+            LabeledContent("Last sync", value: "\(seconds(diagnostics.lastSyncDuration)), \(diagnostics.lastSyncFiles) files merged")
+            LabeledContent("Thumbnail queue", value: "\(diagnostics.thumbQueued) queued, \(diagnostics.thumbRunning) running")
+            LabeledContent("Thumbnails fetched", value: "\(diagnostics.thumbFetched) (\(diagnostics.thumbFailures) failed)")
+            LabeledContent("Warm-up this session", value: "\(diagnostics.warmupDone)")
+            LabeledContent("Backup queue", value: "\(diagnostics.backupQueue)")
+            LabeledContent("Index load", value: seconds(diagnostics.indexLoadTime))
+            LabeledContent("Timeline build", value: seconds(diagnostics.timelineBuildTime))
+            Button("Refresh") { diagnosticsTick += 1 }
+        }
+    }
+
+    private func seconds(_ interval: TimeInterval) -> String {
+        interval < 1 ? String(format: "%.0f ms", interval * 1000) : String(format: "%.1f s", interval)
+    }
+
     private func openSignIn() {
         do {
             signInPage = SignInPage(url: try OAuthWebFlow.authorizeURL())
@@ -165,6 +237,7 @@ struct SettingsView: View {
             try await HiDriveAuth.shared.exchangeCode(code)
             try await store.client.ensureLayout(deviceId: VaultKeys.deviceId)
             await store.refreshConnectionState()
+            await store.configureFetcher()
         } catch {
             authError = "Could not connect: \(error.localizedDescription)"
         }

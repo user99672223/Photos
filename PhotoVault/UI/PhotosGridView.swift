@@ -1,88 +1,5 @@
 import SwiftUI
-import SwiftData
 import Photos
-
-// One cell of the Photos timeline: a vault asset, or a camera-roll asset that is not backed up yet.
-enum TimelineItem: Identifiable {
-    case vault(Asset)
-    case device(PHAsset)
-
-    var id: String {
-        switch self {
-        case .vault(let asset): return "v:" + asset.id
-        case .device(let asset): return "d:" + asset.localIdentifier
-        }
-    }
-
-    var date: Date {
-        switch self {
-        case .vault(let asset): return asset.captured
-        case .device(let asset): return asset.creationDate ?? .distantPast
-        }
-    }
-
-    var vaultAsset: Asset? {
-        if case .vault(let asset) = self { return asset }
-        return nil
-    }
-
-    var deviceAsset: PHAsset? {
-        if case .device(let asset) = self { return asset }
-        return nil
-    }
-}
-
-// Both inputs are sorted newest first; so is the result.
-func mergeTimeline(vault: [Asset], device: [PHAsset]) -> [TimelineItem] {
-    var merged: [TimelineItem] = []
-    merged.reserveCapacity(vault.count + device.count)
-    var v = 0
-    var d = 0
-    while v < vault.count || d < device.count {
-        let takeVault = d >= device.count
-            || (v < vault.count && vault[v].captured >= (device[d].creationDate ?? .distantPast))
-        if takeVault {
-            merged.append(.vault(vault[v]))
-            v += 1
-        } else {
-            merged.append(.device(device[d]))
-            d += 1
-        }
-    }
-    return merged
-}
-
-struct DaySection: Identifiable {
-    var id: Date
-    var title: String
-    var items: [TimelineItem]
-
-    var deviceAssets: [PHAsset] { items.compactMap(\.deviceAsset) }
-}
-
-func makeDaySections(_ items: [TimelineItem]) -> [DaySection] {
-    let calendar = Calendar.current
-    let formatter = DateFormatter()
-    formatter.dateFormat = "d MMM yyyy"
-    var order: [Date] = []
-    var groups: [Date: [TimelineItem]] = [:]
-    for item in items {
-        let day = calendar.startOfDay(for: item.date)
-        if groups[day] == nil { order.append(day) }
-        groups[day, default: []].append(item)
-    }
-    return order.map { day in
-        let title: String
-        if calendar.isDateInToday(day) {
-            title = "Today"
-        } else if calendar.isDateInYesterday(day) {
-            title = "Yesterday"
-        } else {
-            title = formatter.string(from: day)
-        }
-        return DaySection(id: day, title: title, items: groups[day] ?? [])
-    }
-}
 
 func formatDuration(_ seconds: Double) -> String {
     let total = Int(seconds.rounded())
@@ -137,62 +54,69 @@ extension View {
 
 struct PhotosGridView: View {
     @EnvironmentObject var store: VaultStore
-    @Query(filter: #Predicate<Asset> { $0.isDeleted == false }, sort: \Asset.captured, order: .reverse)
-    private var assets: [Asset]
 
     @State private var columnCount = 3
     @State private var selecting = false
-    @State private var selected = Set<String>()
+    @State private var selected: [String: TimelineItem] = [:]
     @State private var viewer: ViewerContext?
     @State private var scrubLabel: String?
     @State private var cellularPrompt: [PHAsset]?
 
     private let columnSteps = [2, 3, 5]
+    private let spacing: CGFloat = 2
 
     var body: some View {
-        let timeline = mergeTimeline(vault: assets, device: store.deviceItems)
         NavigationStack {
-            gridBody(timeline: timeline)
-                .navigationTitle("Photos")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        BackupIndicator()
-                    }
-                    if selecting {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Button("Done") { endSelection() }
-                        }
+            GeometryReader { geo in
+                grid(width: geo.size.width)
+            }
+            .navigationTitle("Photos")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    BackupIndicator()
+                }
+                if selecting {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Done") { endSelection() }
                     }
                 }
-                .fullScreenCover(item: $viewer) { context in
-                    ViewerView(items: context.items, startIndex: context.index)
-                }
+            }
+            .fullScreenCover(item: $viewer) { context in
+                ViewerView(items: context.items, startIndex: context.index)
+            }
         }
         .cellularBackupPrompt($cellularPrompt)
     }
 
-    private func gridBody(timeline: [TimelineItem]) -> some View {
-        let sections = makeDaySections(timeline)
+    // The timeline arrives precomputed; nothing here groups, sorts or filters.
+    private func grid(width: CGFloat) -> some View {
+        let side = max(1, (width - spacing * CGFloat(columnCount - 1)) / CGFloat(columnCount))
+        let timeline = store.timeline
         return ScrollViewReader { proxy in
             ScrollView {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columnCount),
-                          spacing: 2,
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(side), spacing: spacing), count: columnCount),
+                          spacing: spacing,
                           pinnedViews: [.sectionHeaders]) {
-                    ForEach(sections) { section in
+                    ForEach(timeline.sections) { section in
                         Section {
                             ForEach(section.items) { item in
-                                cell(for: item, timeline: timeline)
+                                cell(for: item, side: side)
                             }
                         } header: {
-                            header(for: section)
+                            DayHeader(section: section) { assets in
+                                requestManualBackup(assets, store: store, prompt: $cellularPrompt)
+                            }
                         }
                     }
                 }
+                if timeline.flat.isEmpty {
+                    emptyState
+                }
             }
             .overlay(alignment: .trailing) {
-                DateScrubber(sections: sections, label: $scrubLabel) { day in
-                    proxy.scrollTo(day, anchor: .top)
+                DateScrubber(months: timeline.months, label: $scrubLabel) { sectionId in
+                    proxy.scrollTo(sectionId, anchor: .top)
                 }
             }
             .overlay {
@@ -216,63 +140,49 @@ struct PhotosGridView: View {
             )
             .safeAreaInset(edge: .bottom) {
                 if selecting {
-                    selectionBar(timeline: timeline)
+                    selectionBar
                 }
             }
         }
     }
 
-    private func header(for section: DaySection) -> some View {
-        let pending = section.deviceAssets
-        return HStack {
-            Text(section.title).font(.subheadline.bold())
-            Spacer()
-            if !pending.isEmpty {
-                if pending.allSatisfy({ store.queuedSourceIds.contains($0.localIdentifier) }) {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Button("Back up") {
-                        requestManualBackup(pending, store: store, prompt: $cellularPrompt)
-                    }
-                    .font(.subheadline)
-                    .buttonStyle(.borderless)
-                }
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(.regularMaterial)
-        .id(section.id)
-    }
-
-    private func cell(for item: TimelineItem, timeline: [TimelineItem]) -> some View {
-        let isSelected = selected.contains(item.id)
-        return Group {
-            switch item {
-            case .vault(let asset):
-                ThumbCell(asset: asset, isSelected: isSelected, selecting: selecting)
-            case .device(let asset):
-                DeviceThumbCell(asset: asset, isSelected: isSelected, selecting: selecting)
-            }
-        }
-        .onTapGesture {
-            if selecting {
-                if selected.contains(item.id) {
-                    selected.remove(item.id)
-                } else {
-                    selected.insert(item.id)
-                }
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            if !store.indexReady {
+                ProgressView()
+                Text("Loading library…").foregroundStyle(.secondary)
+            } else if store.isSyncing {
+                ProgressView()
+                Text("Syncing \(store.syncDone)/\(store.syncTotal)").foregroundStyle(.secondary)
             } else {
-                let index = timeline.firstIndex { $0.id == item.id } ?? 0
-                viewer = ViewerContext(id: item.id, items: timeline, index: index)
+                Image(systemName: "photo.on.rectangle").font(.largeTitle).foregroundStyle(.secondary)
+                Text("No photos yet").foregroundStyle(.secondary)
             }
         }
-        .onLongPressGesture {
-            if !selecting {
-                selecting = true
-                selected.insert(item.id)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 120)
+    }
+
+    private func cell(for item: TimelineItem, side: CGFloat) -> some View {
+        TimelineCell(item: item, side: side, isSelected: selected[item.id] != nil,
+                     selecting: selecting, reportsVisibility: true)
+            .onTapGesture {
+                if selecting {
+                    if selected[item.id] != nil {
+                        selected[item.id] = nil
+                    } else {
+                        selected[item.id] = item
+                    }
+                } else {
+                    viewer = ViewerContext(id: item.id, items: store.timeline.flat, index: item.flatIndex)
+                }
             }
-        }
+            .onLongPressGesture {
+                if !selecting {
+                    selecting = true
+                    selected[item.id] = item
+                }
+            }
     }
 
     private func endSelection() {
@@ -281,13 +191,13 @@ struct PhotosGridView: View {
     }
 
     // Share / Favorite / Delete act on vault items only; "Back up" appears when device items are selected.
-    private func selectionBar(timeline: [TimelineItem]) -> some View {
-        let chosen = timeline.filter { selected.contains($0.id) }
-        let vaultChosen = chosen.compactMap(\.vaultAsset)
-        let deviceChosen = chosen.compactMap(\.deviceAsset)
-        let shareURLs: [URL] = vaultChosen.compactMap { asset in
-            CacheManager.cachedOriginal(assetId: asset.id, filename: asset.filename)
-                ?? (CacheManager.hasThumb(assetId: asset.id) ? CacheManager.thumbURL(assetId: asset.id) : nil)
+    private var selectionBar: some View {
+        let chosen = Array(selected.values)
+        let vaultIds = chosen.filter { !$0.isDevice }.map(\.assetId)
+        let deviceChosen = chosen.compactMap(\.phAsset)
+        let shareURLs: [URL] = chosen.filter { !$0.isDevice }.compactMap { item in
+            CacheManager.cachedOriginal(assetId: item.assetId, filename: item.filename)
+                ?? (CacheManager.hasThumb(assetId: item.assetId) ? CacheManager.thumbURL(assetId: item.assetId) : nil)
         }
         return HStack(spacing: 36) {
             ShareLink(items: shareURLs) {
@@ -295,21 +205,19 @@ struct PhotosGridView: View {
             }
             .disabled(shareURLs.isEmpty)
             Button {
-                for asset in vaultChosen {
-                    store.setFavorite(asset, true)
-                }
+                store.setFavorite(ids: vaultIds, true)
                 endSelection()
             } label: {
                 Image(systemName: "heart")
             }
-            .disabled(vaultChosen.isEmpty)
+            .disabled(vaultIds.isEmpty)
             Button(role: .destructive) {
-                store.moveToTrash(vaultChosen)
+                store.moveToTrash(ids: vaultIds)
                 endSelection()
             } label: {
                 Image(systemName: "trash")
             }
-            .disabled(vaultChosen.isEmpty)
+            .disabled(vaultIds.isEmpty)
             if !deviceChosen.isEmpty {
                 Button {
                     requestManualBackup(deviceChosen, store: store, prompt: $cellularPrompt)
@@ -326,6 +234,32 @@ struct PhotosGridView: View {
     }
 }
 
+struct DayHeader: View {
+    @EnvironmentObject var store: VaultStore
+    let section: DaySection
+    let onBackUp: ([PHAsset]) -> Void
+
+    var body: some View {
+        HStack {
+            Text(section.title).font(.subheadline.bold())
+            Spacer()
+            if !section.deviceAssets.isEmpty {
+                if section.deviceAssets.allSatisfy({ store.queuedSourceIds.contains($0.localIdentifier) }) {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button("Back up") { onBackUp(section.deviceAssets) }
+                        .font(.subheadline)
+                        .buttonStyle(.borderless)
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.regularMaterial)
+        .id(section.id)
+    }
+}
+
 struct SelectionMark: View {
     let isSelected: Bool
 
@@ -337,50 +271,80 @@ struct SelectionMark: View {
     }
 }
 
-struct ThumbCell: View {
-    let asset: Asset
+struct TimelineCell: View {
+    let item: TimelineItem
+    let side: CGFloat
     let isSelected: Bool
     let selecting: Bool
+    let reportsVisibility: Bool
+
+    var body: some View {
+        Group {
+            if let phAsset = item.phAsset {
+                DeviceThumbCell(asset: phAsset, side: side)
+            } else {
+                ThumbCell(item: item, side: side, reportsVisibility: reportsVisibility)
+            }
+        }
+        .frame(width: side, height: side)
+        .overlay(alignment: .topTrailing) {
+            if selecting {
+                SelectionMark(isSelected: isSelected)
+            }
+        }
+    }
+}
+
+// Vault thumbnail cell: memory cache first, otherwise the bounded fetcher (disk or network).
+// Fixed size, no GeometryReader, placeholder until the image arrives.
+struct ThumbCell: View {
+    @EnvironmentObject var store: VaultStore
+    let item: TimelineItem
+    let side: CGFloat
+    let reportsVisibility: Bool
     @State private var image: UIImage?
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .bottomLeading) {
-                if let image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: geo.size.width, height: geo.size.width)
-                        .clipped()
-                } else {
-                    Rectangle()
-                        .fill(Color.secondary.opacity(0.2))
-                        .frame(width: geo.size.width, height: geo.size.width)
-                        .overlay(Image(systemName: "photo").foregroundStyle(.secondary))
-                }
-                HStack(spacing: 4) {
-                    if asset.isVideo {
-                        Image(systemName: "play.fill").font(.caption2)
-                        Text(formatDuration(asset.duration)).font(.caption2)
-                    }
-                    if asset.isFavorite {
-                        Image(systemName: "heart.fill").font(.caption2)
-                    }
-                }
-                .foregroundStyle(.white)
-                .shadow(radius: 2)
-                .padding(4)
+        ZStack(alignment: .bottomLeading) {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: side, height: side)
+                    .clipped()
+            } else {
+                Color(uiColor: .secondarySystemFill)
+                    .frame(width: side, height: side)
             }
-            .overlay(alignment: .topTrailing) {
-                if selecting {
-                    SelectionMark(isSelected: isSelected)
+            HStack(spacing: 4) {
+                if item.isVideo {
+                    Image(systemName: "play.fill").font(.caption2)
+                    Text(formatDuration(item.duration)).font(.caption2)
                 }
+                if item.isFavorite {
+                    Image(systemName: "heart.fill").font(.caption2)
+                }
+            }
+            .foregroundStyle(.white)
+            .shadow(radius: 2)
+            .padding(4)
+        }
+        .frame(width: side, height: side)
+        .task(id: item.id) {
+            if let cached = ThumbnailMemoryCache.shared.image(item.assetId) {
+                image = cached
+                return
+            }
+            let fetched = await ThumbnailFetcher.shared.image(for: item.assetId, priority: .visible)
+            if !Task.isCancelled, let fetched {
+                image = fetched
             }
         }
-        .aspectRatio(1, contentMode: .fit)
-        .task(id: asset.id) {
-            let url = CacheManager.thumbURL(assetId: asset.id)
-            image = UIImage(contentsOfFile: url.path)
+        .onAppear {
+            if reportsVisibility { store.planner.appeared(item.flatIndex) }
+        }
+        .onDisappear {
+            if reportsVisibility { store.planner.disappeared(item.flatIndex) }
         }
     }
 }
@@ -388,47 +352,37 @@ struct ThumbCell: View {
 // Camera-roll item that is not in the vault yet; thumbnail comes from PHCachingImageManager at cell size.
 struct DeviceThumbCell: View {
     let asset: PHAsset
-    let isSelected: Bool
-    let selecting: Bool
+    let side: CGFloat
     @Environment(\.displayScale) private var displayScale
     @State private var image: UIImage?
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .bottomLeading) {
-                if let image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: geo.size.width, height: geo.size.width)
-                        .clipped()
-                } else {
-                    Rectangle()
-                        .fill(Color.secondary.opacity(0.2))
-                        .frame(width: geo.size.width, height: geo.size.width)
-                }
-                HStack(spacing: 4) {
-                    Image(systemName: "icloud.slash").font(.caption2)
-                    if asset.mediaType == .video {
-                        Image(systemName: "play.fill").font(.caption2)
-                        Text(formatDuration(asset.duration)).font(.caption2)
-                    }
-                }
-                .foregroundStyle(.white)
-                .shadow(radius: 2)
-                .padding(4)
+        ZStack(alignment: .bottomLeading) {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: side, height: side)
+                    .clipped()
+            } else {
+                Color(uiColor: .secondarySystemFill)
+                    .frame(width: side, height: side)
             }
-            .overlay(alignment: .topTrailing) {
-                if selecting {
-                    SelectionMark(isSelected: isSelected)
+            HStack(spacing: 4) {
+                Image(systemName: "icloud.slash").font(.caption2)
+                if asset.mediaType == .video {
+                    Image(systemName: "play.fill").font(.caption2)
+                    Text(formatDuration(asset.duration)).font(.caption2)
                 }
             }
-            .task(id: "\(asset.localIdentifier)|\(Int(geo.size.width))") {
-                guard geo.size.width > 0 else { return }
-                image = await DeviceMedia.thumbnail(for: asset, side: geo.size.width * displayScale)
-            }
+            .foregroundStyle(.white)
+            .shadow(radius: 2)
+            .padding(4)
         }
-        .aspectRatio(1, contentMode: .fit)
+        .frame(width: side, height: side)
+        .task(id: asset.localIdentifier) {
+            image = await DeviceMedia.thumbnail(for: asset, side: side * displayScale)
+        }
     }
 }
 
@@ -436,7 +390,14 @@ struct BackupIndicator: View {
     @EnvironmentObject var store: VaultStore
 
     var body: some View {
-        if store.isBackingUp {
+        if store.isSyncing {
+            HStack(spacing: 6) {
+                ProgressView()
+                Text("Syncing \(store.syncDone)/\(store.syncTotal)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } else if store.isBackingUp {
             HStack(spacing: 6) {
                 ProgressView()
                 Text("\(store.backupRemaining) left")
@@ -450,9 +411,9 @@ struct BackupIndicator: View {
     }
 }
 
-// Right-edge drag scrubber showing month/year of the section under the finger.
+// Right-edge drag scrubber over the precomputed month markers; jumps straight to a section id.
 struct DateScrubber: View {
-    let sections: [DaySection]
+    let months: [MonthMarker]
     @Binding var label: String?
     let onScrub: (Date) -> Void
 
@@ -466,14 +427,14 @@ struct DateScrubber: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
-                            guard !sections.isEmpty else { return }
+                            guard !months.isEmpty else { return }
                             let fraction = min(max(value.location.y / max(geo.size.height, 1), 0), 0.999)
-                            let index = Int(fraction * CGFloat(sections.count))
-                            let section = sections[index]
-                            let formatter = DateFormatter()
-                            formatter.dateFormat = "MMM yyyy"
-                            label = formatter.string(from: section.id)
-                            onScrub(section.id)
+                            let index = Int(fraction * CGFloat(months.count))
+                            let month = months[index]
+                            if label != month.label {
+                                label = month.label
+                                onScrub(month.sectionId)
+                            }
                         }
                         .onEnded { _ in label = nil }
                 )

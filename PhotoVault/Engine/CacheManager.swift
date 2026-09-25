@@ -28,6 +28,22 @@ enum CacheManager {
         FileManager.default.fileExists(atPath: thumbURL(assetId: assetId).path)
     }
 
+    // One directory listing instead of one stat per asset.
+    static func thumbCacheIds() -> Set<String> {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: thumbsDir.path)) ?? []
+        var ids = Set<String>()
+        ids.reserveCapacity(names.count)
+        for name in names where name.hasSuffix(".jpg") {
+            ids.insert(String(name.dropLast(4)))
+        }
+        return ids
+    }
+
+    static func clearThumbnails() {
+        try? FileManager.default.removeItem(at: thumbsDir)
+        ensureDirectories()
+    }
+
     static func cachedOriginal(assetId: String, filename: String) -> URL? {
         let url = originalURL(assetId: assetId, filename: filename)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil

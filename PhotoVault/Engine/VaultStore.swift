@@ -3,26 +3,53 @@ import SwiftData
 import Photos
 import UIKit
 
+struct DiagnosticsSnapshot {
+    var liveAssets = 0
+    var deletedAssets = 0
+    var sections = 0
+    var thumbsCached = 0
+    var lastSyncDuration: TimeInterval = 0
+    var lastSyncFiles = 0
+    var thumbQueued = 0
+    var thumbRunning = 0
+    var thumbFetched = 0
+    var thumbFailures = 0
+    var backupQueue = 0
+    var warmupDone = 0
+    var indexLoadTime: TimeInterval = 0
+    var timelineBuildTime: TimeInterval = 0
+}
+
 @MainActor
 final class VaultStore: ObservableObject {
     let container: ModelContainer
     var context: ModelContext { container.mainContext }
     let client = HiDriveClient.shared
+    let dataActor: VaultDataActor
+    let index: LibraryIndex
+    let planner = PrefetchPlanner()
+    let warmup: ThumbnailWarmup
 
     @Published var hasVault: Bool
     @Published var onboarded: Bool
     @Published var isConnected = false
     @Published var accountAlias: String?
     @Published var isSyncing = false
+    @Published var syncDone = 0
+    @Published var syncTotal = 0
     @Published var isBackingUp = false
     @Published var backupRemaining = 0
-    @Published var restoreDone = 0
-    @Published var restoreTotal = 0
+    @Published var isRebuilding = false
+    @Published var indexReady = false
     @Published var lastError: String?
-    // Camera-roll assets after the cutoff that are not in the vault, newest first.
-    @Published private(set) var deviceItems: [PHAsset] = []
+    // Precomputed off-main by LibraryIndex; the grid reads these arrays only.
+    @Published private(set) var timeline = Timeline()
     // Local identifiers waiting in (or being processed by) the backup queue.
     @Published private(set) var queuedSourceIds: Set<String> = []
+
+    private(set) var lastSyncDuration: TimeInterval = 0
+    private(set) var lastSyncFiles = 0
+    private(set) var indexLoadTime: TimeInterval = 0
 
     private let libraryObserver = PhotoLibraryObserver()
     private var observingLibrary = false
@@ -34,13 +61,54 @@ final class VaultStore: ObservableObject {
 
     init(container: ModelContainer) {
         self.container = container
+        self.dataActor = VaultDataActor(modelContainer: container)
+        let index = LibraryIndex()
+        self.index = index
+        self.warmup = ThumbnailWarmup(index: index)
         self.hasVault = VaultKeys.masterKey != nil
         self.onboarded = AppSettings.onboardingComplete
         CacheManager.ensureDirectories()
-        Task { await refreshConnectionState() }
+        planner.flatProvider = { [weak self] in self?.timeline.flat ?? [] }
         libraryObserver.onChange = { [weak self] in
             Task { @MainActor in self?.libraryDidChange() }
         }
+        Task { await bootstrap() }
+    }
+
+    private func bootstrap() async {
+        let index = self.index
+        await index.setPublisher { [weak self] timeline in
+            Task { @MainActor in self?.timeline = timeline }
+        }
+        await ThumbnailFetcher.shared.setOnDiskCached { id in
+            Task { await index.markThumbCached(id) }
+        }
+        await refreshConnectionState()
+        await loadIndex()
+        await configureFetcher()
+        await refreshDeviceItems()
+        indexReady = true
+    }
+
+    private func loadIndex() async {
+        let start = Date()
+        let thumbs = await Task.detached { CacheManager.thumbCacheIds() }.value
+        do {
+            let entries = try await dataActor.loadIndex(thumbCache: thumbs)
+            await index.setDuplicateSources(duplicateSourceIds)
+            await index.replaceAll(entries)
+        } catch {
+            lastError = "Could not load the local index: \(error.localizedDescription)"
+        }
+        indexLoadTime = Date().timeIntervalSince(start)
+    }
+
+    func configureFetcher() async {
+        var base: String?
+        if await HiDriveAuth.shared.isConnected {
+            base = try? await client.basePath()
+        }
+        await ThumbnailFetcher.shared.configure(masterKey: VaultKeys.masterKey, basePath: base)
     }
 
     func refreshConnectionState() async {
@@ -54,13 +122,18 @@ final class VaultStore: ObservableObject {
         libraryObserver.register()
     }
 
+    func startWarmupIfAllowed() {
+        guard onboarded, isConnected, hasVault, !isRebuilding else { return }
+        warmup.start()
+    }
+
     // PhotoKit posts bursts of changes (e.g. while iCloud downloads); coalesce them.
     private func libraryDidChange() {
         libraryChangeTask?.cancel()
         libraryChangeTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             guard let self, !Task.isCancelled, self.onboarded else { return }
-            self.refreshDeviceItems()
+            await self.refreshDeviceItems()
             if AppSettings.autoBackupEnabled {
                 // Separate task: cancelling the debounce must not cancel uploads in flight.
                 Task { await self.backupNow() }
@@ -70,18 +143,8 @@ final class VaultStore: ObservableObject {
 
     // MARK: - Index access
 
-    func allAssets() -> [Asset] {
-        (try? context.fetch(FetchDescriptor<Asset>())) ?? []
-    }
-
     func asset(byId id: String) -> Asset? {
         var descriptor = FetchDescriptor<Asset>(predicate: #Predicate { $0.id == id })
-        descriptor.fetchLimit = 1
-        return ((try? context.fetch(descriptor)) ?? []).first
-    }
-
-    private func asset(sourceId: String) -> Asset? {
-        var descriptor = FetchDescriptor<Asset>(predicate: #Predicate { $0.sourceAssetId == sourceId })
         descriptor.fetchLimit = 1
         return ((try? context.fetch(descriptor)) ?? []).first
     }
@@ -103,110 +166,104 @@ final class VaultStore: ObservableObject {
         set { UserDefaults.standard.set(Array(newValue), forKey: "duplicateSourceIds") }
     }
 
-    private func knownSourceIds() -> Set<String> {
-        var ids = duplicateSourceIds
-        for asset in allAssets() where !asset.sourceAssetId.isEmpty {
-            ids.insert(asset.sourceAssetId)
-        }
-        return ids
-    }
-
-    func isInVault(sourceId: String) -> Bool {
-        asset(sourceId: sourceId) != nil || duplicateSourceIds.contains(sourceId)
-    }
-
     // MARK: - Device items
 
-    func refreshDeviceItems() {
+    func refreshDeviceItems() async {
         guard PhotoKitExport.currentAuthorization() else {
-            deviceItems = []
+            await index.setDeviceItems([])
             return
         }
-        let known = knownSourceIds()
-        var items: [PHAsset] = []
-        PhotoKitExport.fetchAssets(createdAfter: AppSettings.autoBackupCutoff, includeVideos: true, newestFirst: true)
-            .enumerateObjects { asset, _, _ in
-                if !known.contains(asset.localIdentifier) { items.append(asset) }
-            }
-        deviceItems = items
+        let cutoff = AppSettings.autoBackupCutoff
+        let items = await Task.detached { () -> [PHAsset] in
+            var out: [PHAsset] = []
+            PhotoKitExport.fetchAssets(createdAfter: cutoff, includeVideos: true, newestFirst: true)
+                .enumerateObjects { asset, _, _ in out.append(asset) }
+            return out
+        }.value
+        await index.setDeviceItems(items)
     }
 
     // MARK: - Sync
 
+    // Journal files are merged one at a time on the data actor; only progress reaches the main thread.
     func syncNow() async {
-        guard !isSyncing, let masterKey = VaultKeys.masterKey else { return }
+        guard !isSyncing, !isRebuilding, let masterKey = VaultKeys.masterKey else { return }
         guard await HiDriveAuth.shared.isConnected else { return }
         isSyncing = true
-        defer { isSyncing = false }
+        let start = Date()
+        var merged = 0
+        defer {
+            isSyncing = false
+            syncTotal = 0
+            syncDone = 0
+        }
         do {
             try await client.ensureLayout(deviceId: VaultKeys.deviceId)
             let base = try await client.basePath()
-            var seen = seenJournalNames()
-            var newEntries: [JournalEntry] = []
+            await configureFetcher()
+            let seen = try await dataActor.seenJournalNames()
+            var files: [(dir: String, name: String)] = []
             let deviceDirs = try await client.list(path: base + "/journal").filter { $0.type == "dir" }
             for dir in deviceDirs {
-                let files = try await client.list(path: base + "/journal/" + dir.name)
+                let names = try await client.list(path: base + "/journal/" + dir.name)
                     .filter { $0.type == "file" }
-                    .sorted { $0.name < $1.name }
-                for file in files {
-                    let seenKey = dir.name + "/" + file.name
-                    if seen.contains(seenKey) { continue }
-                    guard let parsed = JournalCoding.parseJournalFilename(file.name) else { continue }
-                    let tmpEnc = CacheManager.tmpDir.appendingPathComponent(UUID().uuidString)
-                    try await client.downloadFile(path: base + "/journal/" + dir.name + "/" + file.name,
-                                                  to: tmpEnc, allowsCellular: true)
-                    let data = try BlobCrypto.decryptToData(at: tmpEnc, masterKey: masterKey, blobId: parsed.blobId)
-                    try? FileManager.default.removeItem(at: tmpEnc)
-                    newEntries.append(contentsOf: try JournalCoding.decode(data))
-                    context.insert(SeenJournalFile(name: seenKey))
-                    seen.insert(seenKey)
+                    .map(\.name)
+                    .sorted()
+                for name in names where !seen.contains(dir.name + "/" + name) {
+                    files.append((dir.name, name))
                 }
             }
-            apply(entries: newEntries.sorted { $0.ts < $1.ts })
-            try? context.save()
+            syncTotal = files.count
+            syncDone = 0
+            var thumbs = Set<String>()
+            if !files.isEmpty {
+                thumbs = await Task.detached { CacheManager.thumbCacheIds() }.value
+            }
+            for file in files {
+                if Task.isCancelled { break }
+                guard let parsed = JournalCoding.parseJournalFilename(file.name) else {
+                    syncDone += 1
+                    continue
+                }
+                let path = base + "/journal/" + file.dir + "/" + file.name
+                let encrypted = try await client.downloadSmall(path: path)
+                let outcome = try await dataActor.mergeJournalFile(
+                    encrypted: encrypted, blobId: parsed.blobId, masterKey: masterKey,
+                    seenName: file.dir + "/" + file.name, thumbCache: thumbs)
+                await index.remove(ids: outcome.purged)
+                await index.upsert(outcome.upserts)
+                merged += 1
+                syncDone = merged
+            }
         } catch {
             lastError = "Sync failed: \(error.localizedDescription)"
         }
-        refreshDeviceItems()
-        await thumbnailBackfill()
+        lastSyncDuration = Date().timeIntervalSince(start)
+        lastSyncFiles = merged
+        await refreshDeviceItems()
     }
 
-    // Newest ts wins per asset; a "delete" is a tombstone, "purge" removes entirely.
-    private func apply(entries: [JournalEntry]) {
-        for entry in entries {
-            let existing = asset(byId: entry.id)
-            switch entry.op {
-            case "add":
-                guard existing == nil, let meta = entry.meta else { continue }
-                let model = Asset(id: entry.id, filename: meta.filename, kind: meta.kind, mime: meta.mime,
-                                  captured: meta.captured, width: meta.width, height: meta.height,
-                                  duration: meta.duration, bytes: meta.bytes, sha256: meta.sha256,
-                                  sourceAssetId: meta.sourceAssetId, lastJournalTs: entry.ts)
-                model.backedUp = true
-                model.thumbCached = CacheManager.hasThumb(assetId: entry.id)
-                context.insert(model)
-            case "delete":
-                guard let existing, entry.ts >= existing.lastJournalTs else { continue }
-                existing.isDeleted = true
-                existing.deletedAt = entry.ts
-                existing.lastJournalTs = entry.ts
-            case "restore":
-                guard let existing, entry.ts >= existing.lastJournalTs else { continue }
-                existing.isDeleted = false
-                existing.deletedAt = nil
-                existing.lastJournalTs = entry.ts
-            case "favorite", "unfavorite":
-                guard let existing, entry.ts >= existing.lastJournalTs else { continue }
-                existing.isFavorite = entry.op == "favorite"
-                existing.lastJournalTs = entry.ts
-            case "purge":
-                guard let existing else { continue }
-                CacheManager.removeCachedFiles(assetId: existing.id, filename: existing.filename)
-                context.delete(existing)
-            default:
-                continue
-            }
+    // Drops the local SwiftData rows and thumbnail cache, keeps Keychain and settings, then re-syncs.
+    func rebuildLocalIndex() async {
+        guard !isRebuilding, !isSyncing, !isBackingUp else { return }
+        isRebuilding = true
+        indexReady = false
+        warmup.stop()
+        await ThumbnailFetcher.shared.reset()
+        ThumbnailMemoryCache.shared.removeAll()
+        do {
+            try await dataActor.wipeAll()
+        } catch {
+            lastError = "Could not clear the local index: \(error.localizedDescription)"
         }
+        await Task.detached { CacheManager.clearThumbnails() }.value
+        duplicateSourceIds = []
+        await index.setDuplicateSources([])
+        await index.replaceAll([])
+        isRebuilding = false
+        indexReady = true
+        await syncNow()
+        startWarmupIfAllowed()
     }
 
     // MARK: - Journal writing
@@ -239,9 +296,10 @@ final class VaultStore: ObservableObject {
         return pending.filter { $0.op == "add" }.map(\.id)
     }
 
-    private func markBackedUp(_ ids: [String]) {
+    private func markBackedUp(_ ids: [String]) async {
         for id in ids {
             asset(byId: id)?.backedUp = true
+            await index.update(id: id, backedUp: true)
         }
         try? context.save()
     }
@@ -257,7 +315,8 @@ final class VaultStore: ObservableObject {
         repeat {
             flushRequested = false
             do {
-                markBackedUp(try await flushJournal())
+                let ids = try await flushJournal()
+                await markBackedUp(ids)
             } catch {
                 lastError = "Journal upload failed: \(error.localizedDescription)"
                 return
@@ -278,20 +337,23 @@ final class VaultStore: ObservableObject {
 
     // Automatic backup: camera-roll assets created after the cutoff, only when enabled.
     func backupNow(force: Bool = false) async {
-        guard AppSettings.autoBackupEnabled, VaultKeys.masterKey != nil else { return }
+        guard AppSettings.autoBackupEnabled, VaultKeys.masterKey != nil, !isRebuilding else { return }
         guard await HiDriveAuth.shared.isConnected else { return }
         guard PhotoKitExport.currentAuthorization() else { return }
         guard force || backupAllowedNow() else { return }
         // Not starting on cellular: a Wi-Fi-only upload would hold the queue until Wi-Fi returns.
         if AppSettings.wifiOnlyBackup, await NetworkProbe.isCellularOnly() { return }
-        let known = knownSourceIds()
-        var todo: [PHAsset] = []
-        PhotoKitExport.fetchAssets(createdAfter: AppSettings.autoBackupCutoff,
-                                   includeVideos: AppSettings.includeVideos,
-                                   newestFirst: false)
-            .enumerateObjects { asset, _, _ in
-                if !known.contains(asset.localIdentifier) { todo.append(asset) }
-            }
+        let known = await index.knownSourceIds()
+        let cutoff = AppSettings.autoBackupCutoff
+        let includeVideos = AppSettings.includeVideos
+        let todo = await Task.detached { () -> [PHAsset] in
+            var out: [PHAsset] = []
+            PhotoKitExport.fetchAssets(createdAfter: cutoff, includeVideos: includeVideos, newestFirst: false)
+                .enumerateObjects { asset, _, _ in
+                    if !known.contains(asset.localIdentifier) { out.append(asset) }
+                }
+            return out
+        }.value
         enqueueBackup(todo, allowsCellular: !AppSettings.wifiOnlyBackup, first: false)
         await drainBackupQueue()
     }
@@ -303,7 +365,7 @@ final class VaultStore: ObservableObject {
 
     // Manual backup: ignores the automatic toggle and charging rule, and goes ahead of queued automatic items.
     func backup(phAssets: [PHAsset], allowCellular: Bool = false) {
-        guard VaultKeys.masterKey != nil, isConnected else {
+        guard VaultKeys.masterKey != nil, isConnected, !isRebuilding else {
             lastError = "Connect STRATO HiDrive before backing up."
             return
         }
@@ -349,10 +411,10 @@ final class VaultStore: ObservableObject {
             let id = phAsset.localIdentifier
             let allowsCellular = queueAllowsCellular.removeValue(forKey: id) ?? false
             do {
-                if !isInVault(sourceId: id), try await backupOne(phAsset, allowsCellular: allowsCellular) != nil {
+                let known = await index.isKnownSource(id)
+                if !known, try await backupOne(phAsset, allowsCellular: allowsCellular) {
                     addsSinceFlush += 1
                 }
-                deviceItems.removeAll { $0.localIdentifier == id }
             } catch {
                 lastError = "Backup failed for an item: \(error.localizedDescription)"
             }
@@ -367,16 +429,16 @@ final class VaultStore: ObservableObject {
         await flushAndMark()
         isBackingUp = false
         backupRemaining = queuedSourceIds.count
-        refreshDeviceItems()
+        await refreshDeviceItems()
         // Items enqueued during the final flush saw isBackingUp and returned; pick them up now.
         if !backupQueue.isEmpty && !Task.isCancelled {
             await drainBackupQueue()
         }
     }
 
-    // Returns the new Asset when an "add" entry is now pending; nil when the bytes are already in the vault.
-    private func backupOne(_ phAsset: PHAsset, allowsCellular: Bool) async throws -> Asset? {
-        guard let masterKey = VaultKeys.masterKey else { return nil }
+    // Returns true when an "add" entry is now pending; false when the bytes are already in the vault.
+    private func backupOne(_ phAsset: PHAsset, allowsCellular: Bool) async throws -> Bool {
+        guard let masterKey = VaultKeys.masterKey else { return false }
         let base = try await client.basePath()
         let assetId = UUID().uuidString.lowercased()
         let blobId = UUID(uuidString: assetId)!
@@ -387,8 +449,8 @@ final class VaultStore: ObservableObject {
         let sha = try await Task.detached { try PhotoKitExport.sha256OfFile(tmpOriginal) }.value
 
         if let existing = asset(sha256: sha) {
-            linkDuplicate(existing, to: phAsset.localIdentifier)
-            return nil
+            await linkDuplicate(existing, to: phAsset.localIdentifier)
+            return false
         }
 
         guard let thumbImage = await PhotoKitExport.generateThumbnail(phAsset),
@@ -424,6 +486,7 @@ final class VaultStore: ObservableObject {
         model.thumbCached = true
         context.insert(model)
         try? context.save()
+        await index.upsert([IndexEntry(asset: model, thumbCached: true, calendar: Calendar.current)])
 
         let meta = JournalMeta(filename: filename, kind: kind, mime: mime,
                                captured: phAsset.creationDate ?? now,
@@ -432,21 +495,25 @@ final class VaultStore: ObservableObject {
                                sourceAssetId: phAsset.localIdentifier)
         PendingJournal.append(JournalEntry(op: "add", id: assetId, ts: now,
                                            device: VaultKeys.deviceId, meta: meta))
-        return model
+        return true
     }
 
     // Same bytes already in the vault (e.g. a Takeout import, or an upload from another phone): link the
     // asset to this local item without a journal entry. If its link still resolves to a different item on
     // this phone, the two are camera-roll duplicates; re-pointing would make them take the link from each
     // other on every run, so the newcomer is remembered as a duplicate instead.
-    private func linkDuplicate(_ existing: Asset, to localId: String) {
+    private func linkDuplicate(_ existing: Asset, to localId: String) async {
         let current = existing.sourceAssetId
         if !current.isEmpty, current != localId,
            PHAsset.fetchAssets(withLocalIdentifiers: [current], options: nil).count > 0 {
-            duplicateSourceIds.insert(localId)
+            var duplicates = duplicateSourceIds
+            duplicates.insert(localId)
+            duplicateSourceIds = duplicates
+            await index.setDuplicateSources(duplicates)
         } else {
             existing.sourceAssetId = localId
             try? context.save()
+            await index.update(id: existing.id, sourceAssetId: localId)
         }
     }
 
@@ -459,21 +526,31 @@ final class VaultStore: ObservableObject {
                                            device: VaultKeys.deviceId, meta: nil))
     }
 
-    func setFavorite(_ asset: Asset, _ favorite: Bool) {
-        asset.isFavorite = favorite
-        appendUserOp(favorite ? "favorite" : "unfavorite", asset: asset)
+    func setFavorite(ids: [String], _ favorite: Bool) {
+        for id in ids {
+            guard let asset = asset(byId: id) else { continue }
+            asset.isFavorite = favorite
+            appendUserOp(favorite ? "favorite" : "unfavorite", asset: asset)
+        }
         try? context.save()
-        Task { await flushAndMark() }
+        Task {
+            for id in ids { await index.update(id: id, favorite: favorite) }
+            await flushAndMark()
+        }
     }
 
-    func moveToTrash(_ assets: [Asset]) {
-        for asset in assets {
+    func moveToTrash(ids: [String]) {
+        for id in ids {
+            guard let asset = asset(byId: id) else { continue }
             asset.isDeleted = true
             asset.deletedAt = Date()
             appendUserOp("delete", asset: asset)
         }
         try? context.save()
-        Task { await flushAndMark() }
+        Task {
+            for id in ids { await index.update(id: id, deleted: true) }
+            await flushAndMark()
+        }
     }
 
     func restoreFromTrash(_ asset: Asset) {
@@ -481,7 +558,11 @@ final class VaultStore: ObservableObject {
         asset.deletedAt = nil
         appendUserOp("restore", asset: asset)
         try? context.save()
-        Task { await flushAndMark() }
+        let id = asset.id
+        Task {
+            await index.update(id: id, deleted: false)
+            await flushAndMark()
+        }
     }
 
     func purge(_ asset: Asset) async {
@@ -491,10 +572,11 @@ final class VaultStore: ObservableObject {
             try await client.deleteFile(path: base + "/thumbs/" + asset.id + ".enc")
             PendingJournal.append(JournalEntry(op: "purge", id: asset.id, ts: Date(),
                                                device: VaultKeys.deviceId, meta: nil))
-            CacheManager.removeCachedFiles(assetId: asset.id, filename: asset.filename)
+            let id = asset.id
+            CacheManager.removeCachedFiles(assetId: id, filename: asset.filename)
             context.delete(asset)
             try? context.save()
-            refreshDeviceItems()
+            await index.remove(ids: [id])
             await flushAndMark()
         } catch {
             lastError = "Delete failed: \(error.localizedDescription)"
@@ -503,8 +585,9 @@ final class VaultStore: ObservableObject {
 
     func purgeOldTombstones() async {
         let cutoff = Date().addingTimeInterval(-30 * 24 * 3600)
-        let expired = allAssets().filter { $0.isDeleted && ($0.deletedAt ?? .distantFuture) < cutoff }
-        for asset in expired {
+        let descriptor = FetchDescriptor<Asset>(predicate: #Predicate { $0.isDeleted == true })
+        let tombstones = (try? context.fetch(descriptor)) ?? []
+        for asset in tombstones where (asset.deletedAt ?? .distantFuture) < cutoff {
             await purge(asset)
         }
     }
@@ -533,37 +616,30 @@ final class VaultStore: ObservableObject {
         asset.lastViewed = Date()
         CacheManager.touch(destination)
         try? context.save()
-        CacheManager.enforceOriginalsCap(AppSettings.originalsCacheCapBytes)
+        await Task.detached { CacheManager.enforceOriginalsCap(AppSettings.originalsCacheCapBytes) }.value
         return destination
     }
 
-    // MARK: - Thumbnails
+    // MARK: - Diagnostics
 
-    func thumbnailBackfill() async {
-        guard let masterKey = VaultKeys.masterKey else { return }
-        let missing = allAssets().filter { !CacheManager.hasThumb(assetId: $0.id) }
-        guard !missing.isEmpty else { return }
-        restoreTotal = missing.count
-        restoreDone = 0
-        guard let base = try? await client.basePath() else { return }
-        for asset in missing {
-            do {
-                let tmpEnc = CacheManager.tmpDir.appendingPathComponent(asset.id + ".thumb.dl")
-                try await client.downloadFile(path: base + "/thumbs/" + asset.id + ".enc",
-                                              to: tmpEnc, allowsCellular: true)
-                let blobId = UUID(uuidString: asset.id)!
-                let jpeg = try BlobCrypto.decryptToData(at: tmpEnc, masterKey: masterKey, blobId: blobId)
-                try? FileManager.default.removeItem(at: tmpEnc)
-                try jpeg.write(to: CacheManager.thumbURL(assetId: asset.id))
-                asset.thumbCached = true
-            } catch {
-                // Missing thumb is non-fatal; retried on next sync.
-            }
-            restoreDone += 1
-        }
-        try? context.save()
-        restoreTotal = 0
-        restoreDone = 0
+    func diagnostics() async -> DiagnosticsSnapshot {
+        var snapshot = DiagnosticsSnapshot()
+        let counts = await index.counts()
+        snapshot.liveAssets = counts.total - counts.deleted
+        snapshot.deletedAssets = counts.deleted
+        snapshot.thumbsCached = counts.thumbsCached
+        snapshot.sections = timeline.sections.count
+        snapshot.lastSyncDuration = lastSyncDuration
+        snapshot.lastSyncFiles = lastSyncFiles
+        snapshot.thumbQueued = await ThumbnailFetcher.shared.queuedCount
+        snapshot.thumbRunning = await ThumbnailFetcher.shared.runningCount
+        snapshot.thumbFetched = await ThumbnailFetcher.shared.fetchedFromNetwork
+        snapshot.thumbFailures = await ThumbnailFetcher.shared.failures
+        snapshot.backupQueue = queuedSourceIds.count
+        snapshot.warmupDone = warmup.completedThisSession
+        snapshot.indexLoadTime = indexLoadTime
+        snapshot.timelineBuildTime = timeline.buildTime
+        return snapshot
     }
 
     // MARK: - Account
@@ -571,6 +647,8 @@ final class VaultStore: ObservableObject {
     func disconnect() async {
         await HiDriveAuth.shared.disconnect()
         client.resetPathCache()
+        warmup.stop()
         await refreshConnectionState()
+        await configureFetcher()
     }
 }

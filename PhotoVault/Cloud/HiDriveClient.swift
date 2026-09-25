@@ -37,6 +37,43 @@ final class HiDriveClient: NSObject, URLSessionDataDelegate, URLSessionDownloadD
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
 
+    // Small blobs (thumbnails, journal files) use a normal session with bounded parallelism;
+    // the background session stays reserved for uploads and original downloads.
+    private lazy var smallSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = 8
+        config.timeoutIntervalForRequest = 60
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
+
+    func downloadSmall(path: String, allowsCellular: Bool = true) async throws -> Data {
+        var attempt = 0
+        while true {
+            let token = try await HiDriveAuth.shared.validAccessToken()
+            var request = URLRequest(url: makeURL("/file", query: ["path": path]))
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.allowsCellularAccess = allowsCellular
+            do {
+                let (data, response) = try await smallSession.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                if status == 200 { return data }
+                if status == 401 && attempt == 0 {
+                    await HiDriveAuth.shared.invalidateAccessToken()
+                    attempt += 1
+                    continue
+                }
+                throw HiDriveError(statusCode: status, message: "")
+            } catch let error as HiDriveError where error.statusCode == 404 || error.statusCode == 401 {
+                throw error
+            } catch {
+                attempt += 1
+                if attempt >= 3 { throw error }
+                try await Task.sleep(nanoseconds: UInt64(attempt) * 1_500_000_000)
+            }
+        }
+    }
+
     // MARK: - Paths
 
     private var cachedBase: String?
